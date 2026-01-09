@@ -1,0 +1,87 @@
+# Agent configuration
+agent:
+  # Unique agent identifier (leave empty to auto-generate)
+  id: ""
+  
+  # Human-readable name for this agent
+  name: "my-vps-agent"
+  
+  # Custom labels for grouping/filtering
+  labels:
+    environment: "production"
+    region: "asia-southeast"
+
+# Control Plane connection
+control_plane:
+  # gRPC endpoint of Control Plane
+  address: "control.malangpanel.io:9443"
+  
+  # Connection timeout
+  timeout: 30s
+  
+  # Reconnection settings
+  reconnect_interval: 5s
+  max_reconnect_attempts: 0  # 0 = infinite
+
+# TLS configuration
+tls:
+  # Enable mTLS
+  enabled: true
+  
+  # Path to CA certificate
+  ca_cert: "/etc/malangpanel/certs/ca.crt"
+  
+  # Path to agent certificate
+  cert: "/etc/malangpanel/certs/agent.crt"
+  
+  # Path to agent private key
+  key: "/etc/malangpanel/certs/agent.key"
+  
+  # Skip server certificate verification (NOT recommended for production)
+  insecure_skip_verify: false
+
+# Metrics collection
+metrics:
+  # Enable metrics collection
+  enabled: true
+  
+  # Collection interval
+  interval: 10s
+  
+  # Metrics to collect
+  collect:
+    cpu: true
+    memory: true
+    disk: true
+    network: true
+    load: true
+
+# Logging
+logging:
+  # Log level: debug, info, warn, error
+  level: "info"
+  
+  # Log format: json, text
+  format: "text"
+  
+  # Log file (empty = stdout)
+  file: "/var/log/malangpanel-agent.log"
+  
+  # Enable log streaming to Control Plane
+  stream_to_control_plane: true
+
+# Command execution
+executor:
+  # Default shell for command execution
+  shell: "/bin/bash"
+  
+  # Default command timeout (0 = no limit)
+  default_timeout: 300s
+  
+  # Allowed command prefixes (empty = allow all)
+  allowed_commands: []
+  
+  # Blocked command prefixes
+  blocked_commands:
+    - "rm -rf /"
+    - "mkfs"

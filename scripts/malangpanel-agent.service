@@ -1,0 +1,39 @@
+[Unit]
+Description=Malang Panel Agent
+Documentation=https://github.com/budhilaw/malangpanel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Configuration
+Environment=MALANGPANEL_AGENT_CONFIG=/etc/malangpanel/agent.yaml
+
+# Binary
+ExecStart=/usr/local/bin/malangpanel-agent --config ${MALANGPANEL_AGENT_CONFIG}
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=read-only
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=malangpanel-agent
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
