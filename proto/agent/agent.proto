@@ -62,6 +62,7 @@ enum CommandType {
   COMMAND_TYPE_DOCKER = 4;    // Docker operations
   COMMAND_TYPE_FILE = 5;      // File operations (read/write/delete)
   COMMAND_TYPE_SCRIPT = 6;    // Execute script content
+  COMMAND_TYPE_SSH = 7;       // SSH key/config operations
 }
 
 message CommandResponse {
@@ -244,4 +245,56 @@ enum AgentStatus {
   AGENT_STATUS_IDLE = 1;
   AGENT_STATUS_BUSY = 2;
   AGENT_STATUS_ERROR = 3;
+}
+
+// ============== SSH Management ==============
+
+// SSHSyncRequest contains SSH keys to sync to authorized_keys
+message SSHSyncRequest {
+  repeated SSHKeyEntry keys = 1;
+  string target_user = 2;     // Target user (e.g., "root", "ubuntu")
+  bool replace_all = 3;       // If true, replace entire file; if false, merge
+}
+
+message SSHKeyEntry {
+  string id = 1;              // Key ID for tracking
+  string public_key = 2;      // Full public key line
+  string name = 3;            // Human-readable name (for comment)
+  bool is_active = 4;         // Only sync active keys
+}
+
+message SSHSyncResponse {
+  bool success = 1;
+  string message = 2;
+  int32 keys_synced = 3;      // Number of keys written
+  string backup_path = 4;     // Path to backup file if created
+}
+
+// SSHConfigRequest updates sshd_config settings
+message SSHConfigRequest {
+  optional int32 port = 1;              // SSH port (default 22)
+  optional bool permit_root_login = 2;  // PermitRootLogin setting
+  optional bool password_auth = 3;      // PasswordAuthentication setting
+  optional bool pubkey_auth = 4;        // PubkeyAuthentication setting  
+  bool restart_sshd = 5;                // Restart sshd after changes
+  bool validate_config = 6;             // Run sshd -t before applying
+}
+
+message SSHConfigResponse {
+  bool success = 1;
+  string message = 2;
+  string backup_path = 3;     // Path to config backup
+  bool sshd_restarted = 4;    // Whether sshd was restarted
+}
+
+// SSHStatusRequest gets current SSH configuration
+message SSHStatusRequest {}
+
+message SSHStatusResponse {
+  int32 current_port = 1;
+  bool permit_root_login = 2;
+  bool password_auth = 3;
+  bool pubkey_auth = 4;
+  string sshd_status = 5;     // "running", "stopped", "unknown"
+  int32 authorized_keys_count = 6;
 }

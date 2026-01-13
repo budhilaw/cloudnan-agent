@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/budhilaw/malangpanel-agent/internal/config"
 	"github.com/budhilaw/malangpanel-agent/internal/executor"
 	"github.com/budhilaw/malangpanel-agent/internal/monitor"
+	"github.com/budhilaw/malangpanel-agent/internal/ssh"
 	pb "github.com/budhilaw/malangpanel-agent/proto/agent"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -23,10 +25,11 @@ import (
 
 // Agent is the main agent struct
 type Agent struct {
-	cfg      *config.Config
-	executor *executor.Executor
-	monitor  *monitor.Monitor
-	conn     *grpc.ClientConn
+	cfg        *config.Config
+	executor   *executor.Executor
+	monitor    *monitor.Monitor
+	sshHandler *ssh.Handler
+	conn       *grpc.ClientConn
 
 	// Agent state
 	agentID  string
@@ -58,13 +61,15 @@ func New(cfg *config.Config) (*Agent, error) {
 	)
 
 	mon := monitor.New()
+	sshHandler := ssh.NewHandler("/var/backups/malangpanel/ssh")
 
 	return &Agent{
-		cfg:      cfg,
-		executor: exec,
-		monitor:  mon,
-		agentID:  agentID,
-		hostname: hostname,
+		cfg:        cfg,
+		executor:   exec,
+		monitor:    mon,
+		sshHandler: sshHandler,
+		agentID:    agentID,
+		hostname:   hostname,
 	}, nil
 }
 
@@ -515,6 +520,16 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 			execErr = fmt.Errorf("unknown file operation: %s", op)
 		}
 
+	case pb.CommandType_COMMAND_TYPE_SSH:
+		// SSH operations
+		// args[0] = operation (sync_keys, update_config, get_status, restart)
+		if len(cmd.Args) < 1 {
+			execErr = fmt.Errorf("SSH command requires operation")
+			break
+		}
+		op := cmd.Args[0]
+		result = a.executeSSHCommand(op, cmd.Args[1:])
+
 	default:
 		result = &executor.Result{
 			ExitCode: 1,
@@ -589,4 +604,131 @@ func (a *Agent) IsRunning() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.running
+}
+
+// executeSSHCommand handles SSH-specific operations
+func (a *Agent) executeSSHCommand(operation string, args []string) *executor.Result {
+	result := &executor.Result{
+		StartedAt:  time.Now(),
+		FinishedAt: time.Now(),
+	}
+
+	switch operation {
+	case "sync_keys":
+		// args[0] = JSON encoded keys array
+		// args[1] = target user (optional)
+		if len(args) < 1 {
+			result.ExitCode = 1
+			result.Stderr = "sync_keys requires keys JSON as argument"
+			return result
+		}
+
+		var keys []ssh.KeyEntry
+		if err := json.Unmarshal([]byte(args[0]), &keys); err != nil {
+			result.ExitCode = 1
+			result.Stderr = fmt.Sprintf("failed to parse keys JSON: %v", err)
+			return result
+		}
+
+		targetUser := "root"
+		if len(args) > 1 && args[1] != "" {
+			targetUser = args[1]
+		}
+
+		resp := a.sshHandler.SyncKeys(&ssh.SyncKeysRequest{
+			Keys:       keys,
+			TargetUser: targetUser,
+			ReplaceAll: true,
+		})
+
+		if resp.Success {
+			result.Stdout = fmt.Sprintf("Successfully synced %d keys. Backup: %s", resp.KeysSynced, resp.BackupPath)
+		} else {
+			result.ExitCode = 1
+			result.Stderr = resp.Message
+		}
+
+	case "update_config":
+		// args[0] = JSON encoded config update
+		if len(args) < 1 {
+			result.ExitCode = 1
+			result.Stderr = "update_config requires config JSON as argument"
+			return result
+		}
+
+		var req ssh.ConfigUpdateRequest
+		if err := json.Unmarshal([]byte(args[0]), &req); err != nil {
+			result.ExitCode = 1
+			result.Stderr = fmt.Sprintf("failed to parse config JSON: %v", err)
+			return result
+		}
+
+		resp := a.sshHandler.UpdateConfig(&req)
+		if resp.Success {
+			msg := "SSH configuration updated successfully"
+			if resp.SSHDRestarted {
+				msg += " (sshd restarted)"
+			}
+			if resp.BackupPath != "" {
+				msg += fmt.Sprintf(". Backup: %s", resp.BackupPath)
+			}
+			result.Stdout = msg
+		} else {
+			result.ExitCode = 1
+			result.Stderr = resp.Message
+		}
+
+	case "get_status":
+		// args[0] = target user (optional)
+		targetUser := "root"
+		if len(args) > 0 && args[0] != "" {
+			targetUser = args[0]
+		}
+
+		status, err := a.sshHandler.GetStatus(targetUser)
+		if err != nil {
+			result.ExitCode = 1
+			result.Stderr = fmt.Sprintf("failed to get SSH status: %v", err)
+			return result
+		}
+
+		statusJSON, _ := json.Marshal(status)
+		result.Stdout = string(statusJSON)
+
+	case "restart":
+		if err := a.sshHandler.RestartSSHD(); err != nil {
+			result.ExitCode = 1
+			result.Stderr = fmt.Sprintf("failed to restart sshd: %v", err)
+			return result
+		}
+		result.Stdout = "sshd restarted successfully"
+
+	case "remove_key":
+		// args[0] = key ID
+		// args[1] = target user (optional)
+		if len(args) < 1 {
+			result.ExitCode = 1
+			result.Stderr = "remove_key requires key ID as argument"
+			return result
+		}
+
+		targetUser := "root"
+		if len(args) > 1 && args[1] != "" {
+			targetUser = args[1]
+		}
+
+		if err := a.sshHandler.RemoveKey(args[0], targetUser); err != nil {
+			result.ExitCode = 1
+			result.Stderr = fmt.Sprintf("failed to remove key: %v", err)
+			return result
+		}
+		result.Stdout = fmt.Sprintf("Key %s removed successfully", args[0])
+
+	default:
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("unknown SSH operation: %s", operation)
+	}
+
+	result.FinishedAt = time.Now()
+	return result
 }
