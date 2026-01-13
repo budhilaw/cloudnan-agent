@@ -14,6 +14,7 @@ import (
 
 	"github.com/budhilaw/malangpanel-agent/internal/config"
 	"github.com/budhilaw/malangpanel-agent/internal/executor"
+	"github.com/budhilaw/malangpanel-agent/internal/filesystem"
 	"github.com/budhilaw/malangpanel-agent/internal/monitor"
 	"github.com/budhilaw/malangpanel-agent/internal/ssh"
 	pb "github.com/budhilaw/malangpanel-agent/proto/agent"
@@ -29,6 +30,7 @@ type Agent struct {
 	executor   *executor.Executor
 	monitor    *monitor.Monitor
 	sshHandler *ssh.Handler
+	fsManager  *filesystem.Manager
 	conn       *grpc.ClientConn
 
 	// Agent state
@@ -62,12 +64,14 @@ func New(cfg *config.Config) (*Agent, error) {
 
 	mon := monitor.New()
 	sshHandler := ssh.NewHandler("/var/backups/malangpanel/ssh")
+	fsManager := filesystem.New("/")
 
 	return &Agent{
 		cfg:        cfg,
 		executor:   exec,
 		monitor:    mon,
 		sshHandler: sshHandler,
+		fsManager:  fsManager,
 		agentID:    agentID,
 		hostname:   hostname,
 	}, nil
@@ -500,25 +504,9 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 		result, execErr = a.executor.Execute(execCtx, pkgManager, args, nil, timeout)
 
 	case pb.CommandType_COMMAND_TYPE_FILE:
-		// args[0] = operation (cat, ls, rm)
-		// args[1] = path
-		if len(cmd.Args) < 2 {
-			execErr = fmt.Errorf("file command requires operation and path")
-			break
-		}
-		op := cmd.Args[0]
-		path := cmd.Args[1]
-
-		switch op {
-		case "cat", "read":
-			result, execErr = a.executor.Execute(execCtx, "cat", []string{path}, nil, timeout)
-		case "ls", "list":
-			result, execErr = a.executor.Execute(execCtx, "ls", []string{"-la", path}, nil, timeout)
-		case "rm", "delete":
-			result, execErr = a.executor.Execute(execCtx, "rm", []string{"-rf", path}, nil, timeout)
-		default:
-			execErr = fmt.Errorf("unknown file operation: %s", op)
-		}
+		// args[0] = operation
+		// args...
+		result = a.executeFileCommand(cmd.Args)
 
 	case pb.CommandType_COMMAND_TYPE_SSH:
 		// SSH operations
@@ -727,6 +715,120 @@ func (a *Agent) executeSSHCommand(operation string, args []string) *executor.Res
 	default:
 		result.ExitCode = 1
 		result.Stderr = fmt.Sprintf("unknown SSH operation: %s", operation)
+	}
+
+	result.FinishedAt = time.Now()
+
+	result.FinishedAt = time.Now()
+	return result
+}
+
+// executeFileCommand handles File operations
+func (a *Agent) executeFileCommand(args []string) *executor.Result {
+	result := &executor.Result{
+		StartedAt:  time.Now(),
+		FinishedAt: time.Now(),
+	}
+
+	if len(args) < 1 {
+		result.ExitCode = 1
+		result.Stderr = "file command requires operation"
+		return result
+	}
+
+	op := args[0]
+
+	switch op {
+	case "list":
+		// args[1] = path
+		if len(args) < 2 {
+			result.ExitCode = 1
+			result.Stderr = "list requires path"
+			return result
+		}
+		entries, err := a.fsManager.List(args[1])
+		if err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		data, _ := json.Marshal(entries)
+		result.Stdout = string(data)
+
+	case "read":
+		// args[1] = path
+		if len(args) < 2 {
+			result.ExitCode = 1
+			result.Stderr = "read requires path"
+			return result
+		}
+		content, err := a.fsManager.Read(args[1])
+		if err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		result.Stdout = content
+
+	case "write":
+		// args[1] = path, args[2] = content
+		if len(args) < 3 {
+			result.ExitCode = 1
+			result.Stderr = "write requires path and content"
+			return result
+		}
+		if err := a.fsManager.Write(args[1], args[2]); err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		result.Stdout = "File written successfully"
+
+	case "delete":
+		// args[1] = path
+		if len(args) < 2 {
+			result.ExitCode = 1
+			result.Stderr = "delete requires path"
+			return result
+		}
+		if err := a.fsManager.Delete(args[1]); err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		result.Stdout = "File deleted successfully"
+
+	case "mkdir":
+		// args[1] = path
+		if len(args) < 2 {
+			result.ExitCode = 1
+			result.Stderr = "mkdir requires path"
+			return result
+		}
+		if err := a.fsManager.Mkdir(args[1]); err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		result.Stdout = "Directory created successfully"
+
+	case "copy":
+		// args[1] = source, args[2] = dest
+		if len(args) < 3 {
+			result.ExitCode = 1
+			result.Stderr = "copy requires source and destination"
+			return result
+		}
+		if err := a.fsManager.Copy(args[1], args[2]); err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		result.Stdout = "File copied successfully"
+
+	default:
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("unknown file operation: %s", op)
 	}
 
 	result.FinishedAt = time.Now()
