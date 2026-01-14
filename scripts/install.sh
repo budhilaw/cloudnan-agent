@@ -1,6 +1,7 @@
 #!/bin/bash
 # Malang Panel Agent Installation Script
-# Usage: curl -sSL https://budhilaw.com/install.sh | bash -s -- --token TOKEN --id ID --server SERVER
+# Usage: curl -sSL https://budhilaw.com/install.sh | sudo bash -s -- --token TOKEN --id ID --panel PANEL_URL
+# Uninstall: curl -sSL https://budhilaw.com/install.sh | sudo bash -s -- --uninstall
 
 set -e
 
@@ -14,11 +15,14 @@ NC='\033[0m' # No Color
 # Default values
 AGENT_TOKEN=""
 AGENT_ID=""
-SERVER_ADDRESS=""
+PANEL_URL=""
+UNINSTALL=false
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/malangpanel"
+PKI_DIR="/etc/malangpanel/pki"
+LOG_FILE="/var/log/malangpanel-agent.log"
 SERVICE_NAME="malangpanel-agent"
-BINARY_URL="https://github.com/budhilaw/malangpanel/releases/latest/download/malangpanel-agent-linux-amd64"
+BINARY_URL=""
 
 # Print banner
 print_banner() {
@@ -30,7 +34,7 @@ print_banner() {
     echo " |_|  |_|\__,_|_|\__,_|_| |_|\__, |_|   \__,_|_| |_|\___|_|"
     echo "                            |___/                          "
     echo -e "${NC}"
-    echo -e "${GREEN}Agent Installation Script${NC}"
+    echo -e "${GREEN}Agent Installation Script (with mTLS)${NC}"
     echo ""
 }
 
@@ -66,18 +70,24 @@ parse_args() {
                 AGENT_ID="$2"
                 shift 2
                 ;;
-            --server)
-                SERVER_ADDRESS="$2"
+            --panel)
+                PANEL_URL="$2"
                 shift 2
                 ;;
+            --uninstall)
+                UNINSTALL=true
+                shift
+                ;;
             --help)
-                echo "Usage: $0 --token TOKEN --id ID --server SERVER"
+                echo "Usage: $0 --token TOKEN --id ID --panel PANEL_URL"
+                echo "       $0 --uninstall"
                 echo ""
                 echo "Options:"
-                echo "  --token   Authentication token (required)"
-                echo "  --id      Agent ID (required)"
-                echo "  --server  Control plane server address (required)"
-                echo "            Format: hostname:port (e.g., panel.example.com:9443)"
+                echo "  --token     Authentication token (required for install)"
+                echo "  --id        Agent ID (required for install)"
+                echo "  --panel     Panel URL (required for install)"
+                echo "              Example: https://panel.example.com"
+                echo "  --uninstall Remove agent and all configuration"
                 exit 0
                 ;;
             *)
@@ -88,7 +98,7 @@ parse_args() {
     done
 }
 
-# Validate required arguments
+# Validate required arguments for install
 validate_args() {
     if [ -z "$AGENT_TOKEN" ]; then
         print_error "Missing required argument: --token"
@@ -98,8 +108,8 @@ validate_args() {
         print_error "Missing required argument: --id"
         exit 1
     fi
-    if [ -z "$SERVER_ADDRESS" ]; then
-        print_error "Missing required argument: --server"
+    if [ -z "$PANEL_URL" ]; then
+        print_error "Missing required argument: --panel"
         exit 1
     fi
 }
@@ -153,11 +163,13 @@ download_agent() {
     print_success "Agent downloaded to $INSTALL_DIR/$SERVICE_NAME"
 }
 
-# Create config directory
+# Create config directory with proper permissions
 create_config_dir() {
-    print_step "Creating configuration directory..."
+    print_step "Creating configuration directories..."
     mkdir -p "$CONFIG_DIR"
-    print_success "Configuration directory created: $CONFIG_DIR"
+    mkdir -p "$PKI_DIR"
+    chmod 700 "$PKI_DIR"
+    print_success "Configuration directories created"
 }
 
 # Create systemd service
@@ -172,11 +184,11 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=${INSTALL_DIR}/${SERVICE_NAME} -token "${AGENT_TOKEN}" -id "${AGENT_ID}" -server "${SERVER_ADDRESS}"
+ExecStart=${INSTALL_DIR}/${SERVICE_NAME} -token "${AGENT_TOKEN}" -id "${AGENT_ID}" -panel "${PANEL_URL}"
 Restart=always
 RestartSec=5
-StandardOutput=append:/var/log/${SERVICE_NAME}.log
-StandardError=append:/var/log/${SERVICE_NAME}.log
+StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
@@ -196,13 +208,64 @@ start_service() {
     systemctl enable "$SERVICE_NAME" --quiet
     systemctl start "$SERVICE_NAME"
     
-    # Wait a moment and check status
-    sleep 2
+    # Wait for registration to complete
+    print_step "Waiting for certificate registration..."
+    sleep 5
+    
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         print_success "Agent service started successfully"
     else
         print_warning "Service may not have started correctly. Check logs with: journalctl -u $SERVICE_NAME"
     fi
+}
+
+# Uninstall agent
+uninstall_agent() {
+    print_step "Uninstalling Malang Panel Agent..."
+    
+    # Stop and disable service
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        print_step "Stopping service..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+    
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        print_step "Disabling service..."
+        systemctl disable "$SERVICE_NAME" --quiet
+    fi
+    
+    # Remove service file
+    if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        print_step "Removing systemd service..."
+        rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+        systemctl daemon-reload
+    fi
+    
+    # Remove binary
+    if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
+        print_step "Removing binary..."
+        rm -f "$INSTALL_DIR/$SERVICE_NAME"
+    fi
+    
+    # Remove config and PKI directories
+    if [ -d "$CONFIG_DIR" ]; then
+        print_step "Removing configuration and certificates..."
+        rm -rf "$CONFIG_DIR"
+    fi
+    
+    # Remove log file
+    if [ -f "$LOG_FILE" ]; then
+        print_step "Removing log file..."
+        rm -f "$LOG_FILE"
+    fi
+    
+    print_success "Malang Panel Agent uninstalled successfully"
+    echo ""
+    echo "All agent files have been removed:"
+    echo "  - Service: /etc/systemd/system/${SERVICE_NAME}.service"
+    echo "  - Binary:  $INSTALL_DIR/$SERVICE_NAME"
+    echo "  - Config:  $CONFIG_DIR/"
+    echo "  - Logs:    $LOG_FILE"
 }
 
 # Print completion message
@@ -213,14 +276,16 @@ print_completion() {
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
     echo "Agent ID:     $AGENT_ID"
-    echo "Server:       $SERVER_ADDRESS"
+    echo "Panel:        $PANEL_URL"
     echo ""
     echo "Useful commands:"
-    echo "  View logs:     journalctl -u $SERVICE_NAME -f"
+    echo "  View logs:     tail -f $LOG_FILE"
     echo "  Check status:  systemctl status $SERVICE_NAME"
     echo "  Restart:       systemctl restart $SERVICE_NAME"
     echo "  Stop:          systemctl stop $SERVICE_NAME"
+    echo "  Uninstall:     curl -sSL https://budhilaw.com/install.sh | sudo bash -s -- --uninstall"
     echo ""
+    echo "Certificates:  $PKI_DIR/"
     echo "Config file:   $CONFIG_DIR/agent.yaml"
     echo "Binary:        $INSTALL_DIR/$SERVICE_NAME"
     echo ""
@@ -230,8 +295,14 @@ print_completion() {
 main() {
     print_banner
     parse_args "$@"
-    validate_args
     check_root
+    
+    if [ "$UNINSTALL" = true ]; then
+        uninstall_agent
+        exit 0
+    fi
+    
+    validate_args
     detect_arch
     download_agent
     create_config_dir
