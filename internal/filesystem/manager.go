@@ -3,6 +3,7 @@ package filesystem
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,8 +35,14 @@ type Manager struct {
 
 func New(rootDir string) *Manager {
 	if rootDir == "" {
+		// Auto-detect: if running in a container with host filesystem mounted at /hostfs, use that
+		// Otherwise, default to /
 		rootDir = "/"
+		if _, err := os.Stat("/hostfs"); err == nil {
+			rootDir = "/hostfs"
+		}
 	}
+	log.Printf("[FileSystem] Manager initialized with root: %s", rootDir)
 	return &Manager{rootDir: rootDir}
 }
 
@@ -47,18 +54,25 @@ func (m *Manager) resolvePath(p string) (string, error) {
 func (m *Manager) List(path string) ([]*FileEntry, error) {
 	fullPath, err := m.resolvePath(path)
 	if err != nil {
+		log.Printf("[FileSystem] List: resolvePath error for %q: %v", path, err)
 		return nil, err
 	}
 
+	log.Printf("[FileSystem] List: path=%q fullPath=%q rootDir=%q", path, fullPath, m.rootDir)
+
 	entries, err := os.ReadDir(fullPath)
 	if err != nil {
+		log.Printf("[FileSystem] List: ReadDir error for %q: %v", fullPath, err)
 		return nil, err
 	}
+
+	log.Printf("[FileSystem] List: found %d entries in %q", len(entries), fullPath)
 
 	var result []*FileEntry
 	for _, entry := range entries {
 		info, err := entry.Info()
 		if err != nil {
+			log.Printf("[FileSystem] List: entry.Info() error for %q: %v", entry.Name(), err)
 			continue
 		}
 
@@ -93,6 +107,7 @@ func (m *Manager) List(path string) ([]*FileEntry, error) {
 		return result[i].Name < result[j].Name
 	})
 
+	log.Printf("[FileSystem] List: returning %d entries for path %q", len(result), path)
 	return result, nil
 }
 
@@ -110,12 +125,16 @@ func (m *Manager) Read(path string) (string, error) {
 }
 
 func (m *Manager) Write(path string, content string) error {
+	return m.WriteBytes(path, []byte(content))
+}
+
+func (m *Manager) WriteBytes(path string, content []byte) error {
 	fullPath, err := m.resolvePath(path)
 	if err != nil {
 		return err
 	}
 	// 0644 is standard
-	return os.WriteFile(fullPath, []byte(content), 0644)
+	return os.WriteFile(fullPath, content, 0644)
 }
 
 func (m *Manager) Delete(path string) error {

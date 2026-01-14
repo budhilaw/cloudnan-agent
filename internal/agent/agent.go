@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -746,14 +747,18 @@ func (a *Agent) executeFileCommand(args []string) *executor.Result {
 			result.Stderr = "list requires path"
 			return result
 		}
+		log.Printf("[FileCommand] list: requesting path=%q", args[1])
 		entries, err := a.fsManager.List(args[1])
 		if err != nil {
+			log.Printf("[FileCommand] list: error: %v", err)
 			result.ExitCode = 1
 			result.Stderr = err.Error()
 			return result
 		}
+		log.Printf("[FileCommand] list: got %d entries", len(entries))
 		data, _ := json.Marshal(entries)
 		result.Stdout = string(data)
+		log.Printf("[FileCommand] list: stdout length=%d", len(result.Stdout))
 
 	case "read":
 		// args[1] = path
@@ -778,6 +783,26 @@ func (a *Agent) executeFileCommand(args []string) *executor.Result {
 			return result
 		}
 		if err := a.fsManager.Write(args[1], args[2]); err != nil {
+			result.ExitCode = 1
+			result.Stderr = err.Error()
+			return result
+		}
+		result.Stdout = "File written successfully"
+
+	case "write_base64":
+		// args[1] = path, args[2] = base64_content
+		if len(args) < 3 {
+			result.ExitCode = 1
+			result.Stderr = "write_base64 requires path and content"
+			return result
+		}
+		data, err := base64.StdEncoding.DecodeString(args[2])
+		if err != nil {
+			result.ExitCode = 1
+			result.Stderr = fmt.Sprintf("invalid base64: %v", err)
+			return result
+		}
+		if err := a.fsManager.WriteBytes(args[1], data); err != nil {
 			result.ExitCode = 1
 			result.Stderr = err.Error()
 			return result
