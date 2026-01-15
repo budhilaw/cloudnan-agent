@@ -1,7 +1,7 @@
 #!/bin/bash
 # Cloudnan Agent Installation Script
-# Usage: curl -sSL https://budhilaw.com/install.sh | sudo bash -s -- --token TOKEN --id ID --panel PANEL_URL
-# Uninstall: curl -sSL https://budhilaw.com/install.sh | sudo bash -s -- --uninstall
+# Usage: curl -sSL https://cloudnan.com/download/install.sh | sudo bash -s -- --token TOKEN --id ID --panel PANEL_URL
+# Uninstall: curl -sSL https://cloudnan.com/download/install.sh | sudo bash -s -- --uninstall
 
 set -e
 
@@ -128,10 +128,10 @@ detect_arch() {
     ARCH=$(uname -m)
     case $ARCH in
         x86_64)
-            BINARY_URL="https://budhilaw.com/cloudnan-agent-linux-amd64"
+            BINARY_URL="https://cloudnan.com/downloads/cloudnan-agent-linux-amd64"
             ;;
         aarch64|arm64)
-            BINARY_URL="https://budhilaw.com/cloudnan-agent-linux-arm64"
+            BINARY_URL="https://cloudnan.com/downloads/cloudnan-agent-linux-arm64"
             ;;
         *)
             print_error "Unsupported architecture: $ARCH"
@@ -284,7 +284,7 @@ print_completion() {
     echo "  Check status:  systemctl status $SERVICE_NAME"
     echo "  Restart:       systemctl restart $SERVICE_NAME"
     echo "  Stop:          systemctl stop $SERVICE_NAME"
-    echo "  Uninstall:     curl -sSL https://budhilaw.com/install.sh | sudo bash -s -- --uninstall"
+    echo "  Uninstall:     curl -sSL https://cloudnan.com/download/install.sh | sudo bash -s -- --uninstall"
     echo ""
     echo "Certificates:  $PKI_DIR/"
     echo "Config file:   $CONFIG_DIR/agent.yaml"
