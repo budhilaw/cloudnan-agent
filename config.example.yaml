@@ -14,7 +14,7 @@ agent:
 # Control Plane connection
 control_plane:
   # gRPC endpoint of Control Plane
-  address: "control.cloudnan.com:9443"
+  address: "grpc.cloudnan.com:9443"
   
   # Connection timeout
   timeout: 30s
