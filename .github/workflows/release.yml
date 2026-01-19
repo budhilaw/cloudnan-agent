@@ -116,10 +116,12 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           envs: VERSION
+          script_stop: true
           script: |
             cd /home/kai/Projects/cloudnan
-            echo "${VERSION}" > version.txt
+            /bin/bash -c "echo '$VERSION' > version.txt"
             chmod 644 version.txt
-            echo "Created version.txt with version: ${VERSION}"
+            echo "Created version.txt with version: $VERSION"
             cat version.txt
+
 
