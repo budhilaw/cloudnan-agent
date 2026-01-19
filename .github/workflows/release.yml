@@ -103,12 +103,10 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           envs: VERSION
           script: |
-            /bin/bash << 'SCRIPT'
             cd /home/kai/Projects/cloudnan
             chmod +x cloudnan-agent-linux-amd64 cloudnan-agent-linux-arm64 install.sh
             ls -la
-            echo "$VERSION" > version.txt
+            printf '%s\n' "$VERSION" > version.txt
             cat version.txt
-            echo "Deployment complete!"
-            SCRIPT
+            echo Deployment complete!
 
