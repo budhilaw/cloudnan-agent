@@ -17,6 +17,7 @@ AGENT_TOKEN=""
 AGENT_ID=""
 PANEL_URL=""
 UNINSTALL=false
+UPGRADE=false
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/cloudnan"
 PKI_DIR="/etc/cloudnan/pki"
@@ -79,9 +80,14 @@ parse_args() {
                 UNINSTALL=true
                 shift
                 ;;
+            --upgrade)
+                UPGRADE=true
+                shift
+                ;;
             --help)
                 echo "Usage: $0 --token TOKEN --id ID --panel PANEL_URL"
                 echo "       $0 --uninstall"
+                echo "       $0 --upgrade"
                 echo ""
                 echo "Options:"
                 echo "  --token     Authentication token (required for install)"
@@ -89,6 +95,7 @@ parse_args() {
                 echo "  --panel     Panel URL (required for install)"
                 echo "              Example: https://panel.example.com"
                 echo "  --uninstall Remove agent and all configuration"
+                echo "  --upgrade   Upgrade existing agent to latest version (OTA update)"
                 exit 0
                 ;;
             *)
@@ -269,6 +276,57 @@ uninstall_agent() {
     echo "  - Logs:    $LOG_FILE"
 }
 
+# Upgrade agent (OTA update)
+upgrade_agent() {
+    print_step "Upgrading Cloudnan Agent..."
+    
+    # Check if agent is installed
+    if [ ! -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
+        print_error "Agent not installed. Run install first."
+        exit 1
+    fi
+    
+    # Get current version before upgrade
+    CURRENT_VERSION=$("$INSTALL_DIR/$SERVICE_NAME" -version 2>/dev/null || echo "unknown")
+    print_step "Current version: $CURRENT_VERSION"
+    
+    # Stop service
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        print_step "Stopping service..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+    
+    # Detect architecture and download new binary
+    detect_arch
+    download_agent
+    
+    # Start service
+    print_step "Starting upgraded service..."
+    systemctl start "$SERVICE_NAME"
+    
+    # Wait for startup
+    sleep 3
+    
+    # Get new version
+    NEW_VERSION=$("$INSTALL_DIR/$SERVICE_NAME" -version 2>/dev/null || echo "unknown")
+    
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        print_success "Agent upgraded successfully!"
+        echo ""
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  Upgrade Complete!${NC}"
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "Previous version: $CURRENT_VERSION"
+        echo "New version:      $NEW_VERSION"
+        echo ""
+    else
+        print_error "Service failed to start after upgrade. Check logs:"
+        echo "  journalctl -u $SERVICE_NAME -n 50"
+        exit 1
+    fi
+}
+
 # Print completion message
 print_completion() {
     echo ""
@@ -303,6 +361,11 @@ main() {
         exit 0
     fi
     
+    if [ "$UPGRADE" = true ]; then
+        upgrade_agent
+        exit 0
+    fi
+    
     validate_args
     detect_arch
     download_agent
@@ -314,3 +377,4 @@ main() {
 
 # Run main
 main "$@"
+

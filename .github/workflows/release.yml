@@ -105,3 +105,21 @@ jobs:
             chmod +x cloudnan-agent-linux-amd64 cloudnan-agent-linux-arm64 install.sh
             ls -la
             echo "Deployment complete!"
+
+      - name: Create version manifest
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: VERSION
+          script: |
+            cd /home/kai/Projects/cloudnan
+            echo "${VERSION}" > version.txt
+            chmod 644 version.txt
+            echo "Created version.txt with version: ${VERSION}"
+            cat version.txt
+
