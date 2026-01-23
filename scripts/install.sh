@@ -290,41 +290,51 @@ upgrade_agent() {
     CURRENT_VERSION=$("$INSTALL_DIR/$SERVICE_NAME" -version 2>/dev/null || echo "unknown")
     print_step "Current version: $CURRENT_VERSION"
     
-    # Stop service
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        print_step "Stopping service..."
-        systemctl stop "$SERVICE_NAME"
-    fi
-    
-    # Detect architecture and download new binary
+    # Detect architecture
     detect_arch
-    download_agent
     
-    # Start service
-    print_step "Starting upgraded service..."
-    systemctl start "$SERVICE_NAME"
-    
-    # Wait for startup
-    sleep 3
-    
-    # Get new version
-    NEW_VERSION=$("$INSTALL_DIR/$SERVICE_NAME" -version 2>/dev/null || echo "unknown")
-    
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        print_success "Agent upgraded successfully!"
-        echo ""
-        echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-        echo -e "${GREEN}  Upgrade Complete!${NC}"
-        echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-        echo ""
-        echo "Previous version: $CURRENT_VERSION"
-        echo "New version:      $NEW_VERSION"
-        echo ""
+    # Download new binary to temp location first
+    print_step "Downloading new agent binary..."
+    TEMP_BINARY="/tmp/cloudnan-agent-new"
+    if command -v curl &> /dev/null; then
+        curl -sSL "$BINARY_URL" -o "$TEMP_BINARY"
+    elif command -v wget &> /dev/null; then
+        wget -q "$BINARY_URL" -O "$TEMP_BINARY"
     else
-        print_error "Service failed to start after upgrade. Check logs:"
-        echo "  journalctl -u $SERVICE_NAME -n 50"
+        print_error "Neither curl nor wget found."
         exit 1
     fi
+    chmod +x "$TEMP_BINARY"
+    print_success "Downloaded new binary"
+    
+    # Create upgrade script that will run after we exit
+    UPGRADE_SCRIPT="/tmp/cloudnan-upgrade-finish.sh"
+    cat > "$UPGRADE_SCRIPT" << 'UPGRADE_EOF'
+#!/bin/bash
+sleep 2
+systemctl stop cloudnan-agent 2>/dev/null || true
+sleep 1
+cp /tmp/cloudnan-agent-new /usr/local/bin/cloudnan-agent
+chmod +x /usr/local/bin/cloudnan-agent
+rm -f /tmp/cloudnan-agent-new
+systemctl start cloudnan-agent
+rm -f /tmp/cloudnan-upgrade-finish.sh
+UPGRADE_EOF
+    chmod +x "$UPGRADE_SCRIPT"
+    
+    print_step "Starting upgrade process..."
+    
+    # Run the upgrade script in background, detached from this process
+    nohup "$UPGRADE_SCRIPT" > /var/log/cloudnan-upgrade.log 2>&1 &
+    
+    print_success "Upgrade initiated! Agent will restart shortly."
+    echo ""
+    echo "The agent will:"
+    echo "  1. Stop the current service"
+    echo "  2. Replace the binary"
+    echo "  3. Start the new version"
+    echo ""
+    echo "Check status in a few seconds with: systemctl status cloudnan-agent"
 }
 
 # Print completion message
