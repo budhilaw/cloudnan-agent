@@ -183,6 +183,9 @@ func (m *SSHDConfigManager) UpdateConfig(port *int, permitRootLogin, passwordAut
 		if err := m.updatePortInDefaultIncludeDir(*port); err != nil {
 			return backupPath, fmt.Errorf("failed to update port in default include dir: %w", err)
 		}
+		if err := m.updateSystemdSocketPort(*port); err != nil {
+			return backupPath, fmt.Errorf("failed to update systemd ssh.socket port: %w", err)
+		}
 	}
 
 	return backupPath, nil
@@ -323,6 +326,12 @@ func (m *SSHDConfigManager) ValidateConfig() error {
 
 // RestartSSHD restarts the SSH daemon
 func (m *SSHDConfigManager) RestartSSHD() error {
+	// If socket-activated, restart socket first
+	if m.isSystemdSocketActive("ssh.socket") {
+		_ = exec.Command("systemctl", "daemon-reload").Run()
+		_ = exec.Command("systemctl", "restart", "ssh.socket").Run()
+	}
+
 	// Try systemctl first (most modern systems)
 	cmd := exec.Command("systemctl", "restart", "sshd")
 	if err := cmd.Run(); err == nil {
@@ -343,6 +352,49 @@ func (m *SSHDConfigManager) RestartSSHD() error {
 
 	cmd = exec.Command("service", "ssh", "restart")
 	return cmd.Run()
+}
+
+// updateSystemdSocketPort updates ssh.socket ListenStream port if socket activation is enabled
+func (m *SSHDConfigManager) updateSystemdSocketPort(port int) error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return nil
+	}
+	if !m.isSystemdSocketActive("ssh.socket") && !m.isSystemdSocketInstalled("ssh.socket") {
+		return nil
+	}
+
+	dir := "/etc/systemd/system/ssh.socket.d"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	overridePath := filepath.Join(dir, "override.conf")
+	content := fmt.Sprintf("[Socket]\nListenStream=\nListenStream=%d\n", port)
+	if err := os.WriteFile(overridePath, []byte(content), 0644); err != nil {
+		return err
+	}
+
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	_ = exec.Command("systemctl", "restart", "ssh.socket").Run()
+	_ = exec.Command("systemctl", "restart", "ssh").Run()
+
+	return nil
+}
+
+func (m *SSHDConfigManager) isSystemdSocketActive(unit string) bool {
+	cmd := exec.Command("systemctl", "is-active", unit)
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(output)) == "active"
+}
+
+func (m *SSHDConfigManager) isSystemdSocketInstalled(unit string) bool {
+	cmd := exec.Command("systemctl", "cat", unit)
+	return cmd.Run() == nil
 }
 
 // GetEffectivePorts returns the effective ports from sshd -T output
