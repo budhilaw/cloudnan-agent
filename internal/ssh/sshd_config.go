@@ -180,9 +180,31 @@ func (m *SSHDConfigManager) UpdateConfig(port *int, permitRootLogin, passwordAut
 		if err := m.updatePortInIncludedFiles(*port); err != nil {
 			return backupPath, fmt.Errorf("failed to update port in included sshd configs: %w", err)
 		}
+		if err := m.updatePortInDefaultIncludeDir(*port); err != nil {
+			return backupPath, fmt.Errorf("failed to update port in default include dir: %w", err)
+		}
 	}
 
 	return backupPath, nil
+}
+
+// updatePortInDefaultIncludeDir updates Port directives under /etc/ssh/sshd_config.d/*.conf
+func (m *SSHDConfigManager) updatePortInDefaultIncludeDir(port int) error {
+	pattern := "/etc/ssh/sshd_config.d/*.conf"
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if err := m.updatePortInFile(path, port); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // updatePortInIncludedFiles replaces any Port directives in included sshd config files
@@ -321,6 +343,32 @@ func (m *SSHDConfigManager) RestartSSHD() error {
 
 	cmd = exec.Command("service", "ssh", "restart")
 	return cmd.Run()
+}
+
+// GetEffectivePorts returns the effective ports from sshd -T output
+func (m *SSHDConfigManager) GetEffectivePorts() ([]int, error) {
+	cmd := exec.Command("sshd", "-T")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("sshd -T failed: %s", string(output))
+	}
+
+	ports := []int{}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "port ") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		if p, err := strconv.Atoi(parts[1]); err == nil {
+			ports = append(ports, p)
+		}
+	}
+
+	return ports, nil
 }
 
 // GetSSHDStatus returns the status of the SSH daemon

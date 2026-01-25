@@ -128,6 +128,34 @@ func (h *Handler) UpdateConfig(req *ConfigUpdateRequest) *ConfigUpdateResponse {
 			}
 		}
 		sshdRestarted = true
+
+		// Verify effective port if provided
+		if req.Port != nil {
+			ports, err := h.configManager.GetEffectivePorts()
+			if err != nil {
+				return &ConfigUpdateResponse{
+					Success:    false,
+					Message:    fmt.Sprintf("Config updated but failed to verify sshd port: %v", err),
+					BackupPath: backupPath,
+				}
+			}
+			if len(ports) == 0 {
+				return &ConfigUpdateResponse{
+					Success:    false,
+					Message:    "Config updated but sshd reported no active ports",
+					BackupPath: backupPath,
+				}
+			}
+			for _, p := range ports {
+				if p != *req.Port {
+					return &ConfigUpdateResponse{
+						Success:    false,
+						Message:    fmt.Sprintf("Config updated but sshd still listening on port %d", p),
+						BackupPath: backupPath,
+					}
+				}
+			}
+		}
 	}
 
 	return &ConfigUpdateResponse{
