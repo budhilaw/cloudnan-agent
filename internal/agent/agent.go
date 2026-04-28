@@ -73,6 +73,10 @@ func New(cfg *config.Config, version string) (*Agent, error) {
 		agentID = fmt.Sprintf("agent-%s-%d", hostname, time.Now().Unix())
 	}
 
+	// Bind the agent_id into the destructive-op token verifier so it can
+	// reject tokens minted for a different agent (cross-agent replay defense).
+	database.SetAgentID(agentID)
+
 	exec := executor.New(
 		cfg.Executor.Shell,
 		cfg.Executor.DefaultTimeout,
@@ -297,8 +301,23 @@ func (a *Agent) connect(ctx context.Context) error {
 				return err
 			}
 
+			updates := res.GetConfigUpdates()
+
+			// Per-agent op-token secret for destructive database operations.
+			// Refreshed on every heartbeat so a server-side rotation
+			// (cert renewal, manual rotate) propagates within one tick. The
+			// secret rides the existing mTLS-protected channel; we never
+			// persist it to disk.
+			if encoded := updates["op_token_secret"]; encoded != "" {
+				if raw, decErr := base64.StdEncoding.DecodeString(encoded); decErr == nil {
+					database.SetOpTokenSecret(raw)
+				} else {
+					log.Printf("Heartbeat: op_token_secret base64 decode failed: %v", decErr)
+				}
+			}
+
 			// Heartbeat-based reconnect signal (fallback when command stream not available)
-			if res.GetConfigUpdates()["action"] == "reconnect" {
+			if updates["action"] == "reconnect" {
 				log.Println("Server requested reconnect via heartbeat — fast handoff")
 				a.fastReconnect.Store(true)
 				return nil

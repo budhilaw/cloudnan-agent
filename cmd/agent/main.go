@@ -12,6 +12,7 @@ import (
 
 	"github.com/cloudnan-tech/cloudnan-agent/internal/agent"
 	"github.com/cloudnan-tech/cloudnan-agent/internal/config"
+	"github.com/cloudnan-tech/cloudnan-agent/internal/database"
 	"github.com/cloudnan-tech/cloudnan-agent/internal/pki"
 )
 
@@ -118,7 +119,7 @@ func main() {
 
 				// Register certificate with panel
 				log.Printf("Requesting certificate from panel...")
-				certPEM, err := client.RegisterCertificate(cfg.Agent.ID, cfg.Agent.Token, csrPEM)
+				certPEM, opTokenSecret, err := client.RegisterCertificate(cfg.Agent.ID, cfg.Agent.Token, csrPEM)
 				if err != nil {
 					log.Fatalf("Failed to register certificate: %v", err)
 				}
@@ -128,6 +129,14 @@ func main() {
 					log.Fatalf("Failed to save certificate: %v", err)
 				}
 				log.Printf("Certificate saved to %s", certPath)
+
+				// Hand the per-agent op-token secret to the destructive-op
+				// verifier so the first heartbeat-less window after install
+				// is still able to run drop_db / drop_user / exec_query.
+				// Heartbeat refreshes this on every tick — see internal/agent.
+				if len(opTokenSecret) > 0 {
+					database.SetOpTokenSecret(opTokenSecret)
+				}
 			} else {
 				log.Printf("Valid certificate found at %s", certPath)
 			}

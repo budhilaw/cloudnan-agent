@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"time"
+
+	"github.com/cloudnan-tech/cloudnan-agent/internal/database"
 )
 
 // RenewalChecker periodically checks if the certificate needs renewal
@@ -103,10 +105,17 @@ func (r *RenewalChecker) checkAndRenew() {
 
 	// Request renewal
 	client := NewRegistrationClient(r.panelURL)
-	newCertPEM, err := client.RenewCertificate(r.agentID, csrPEM, cert, caCertPool)
+	newCertPEM, opTokenSecret, err := client.RenewCertificate(r.agentID, csrPEM, cert, caCertPool)
 	if err != nil {
 		log.Printf("[PKI] Certificate renewal failed: %v", err)
 		return
+	}
+
+	// Pick up the rotated per-agent op-token secret. Cert renewal is the
+	// natural rotation point; missing field means the panel deferred to
+	// heartbeat-driven rotation, which is fine.
+	if len(opTokenSecret) > 0 {
+		database.SetOpTokenSecret(opTokenSecret)
 	}
 
 	// Save new key and certificate to temporary locations first
