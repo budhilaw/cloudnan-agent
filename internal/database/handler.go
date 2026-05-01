@@ -88,6 +88,8 @@ func (h *Handler) Execute(ctx context.Context, args []string) *Result {
 		return h.opGrantCmd(ctx, args)
 	case "drop_user":
 		return h.opDropUserCmd(ctx, args)
+	case "provision_dump_user":
+		return h.opProvisionDumpUserCmd(ctx, args)
 	case "exec_query", "export_dump", "restore_dump":
 		return errResult(fmt.Sprintf("database op %q is streaming; caller must use ExecuteStreaming", op))
 	default:
