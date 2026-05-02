@@ -127,11 +127,24 @@ func (h *Handler) opProvisionDumpUser(ctx context.Context, req *provisionDumpUse
 		return nil, fmt.Errorf("alter user (rotate password): %w", err)
 	}
 
-	// Privilege set required for mysqldump --single-transaction
-	// --routines --events --triggers across every database on the
-	// instance. Read-only — explicit list, no GRANT ALL.
+	// Privilege set covers BOTH export (mysqldump) and restore (mysql
+	// stream-in including CREATE DATABASE for the target).
+	//
+	//   Export: SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, RELOAD,
+	//           REPLICATION CLIENT
+	//   Restore (additive): CREATE, DROP, INSERT, UPDATE, DELETE, ALTER,
+	//           INDEX, REFERENCES, CREATE VIEW, CREATE ROUTINE,
+	//           ALTER ROUTINE, EXECUTE, CREATE TEMPORARY TABLES
+	//
+	// Deliberately excluded: SUPER, GRANT OPTION, FILE, PROCESS,
+	// SHUTDOWN, REPLICATION SLAVE, CREATE USER. The panel-managed
+	// user can move data, schema, and routines around, but it can't
+	// create other users / shut the server down / read OS files.
 	grantStmt := fmt.Sprintf(
-		"GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, RELOAD, REPLICATION CLIENT "+
+		"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER, "+
+			"REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, "+
+			"CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, "+
+			"EVENT, TRIGGER, RELOAD, REPLICATION CLIENT "+
 			"ON *.* TO '%s'@'localhost'",
 		escapeSQLString(dumpUserName),
 	)
