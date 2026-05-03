@@ -277,6 +277,19 @@ func (a *Agent) connect(ctx context.Context) error {
 	go a.runCommandStream(commandCtx, client, a.cfg.Agent.Token)
 	go a.runMetricsStream(commandCtx, client, a.cfg.Agent.Token)
 
+	// Fire one heartbeat immediately so the agent picks up the
+	// op_token_secret (and any pending reconnect signal) within seconds
+	// of startup, instead of waiting up to 30s for the first ticker. The
+	// secret is in-memory only — every restart with an existing cert
+	// arrives with localStore.secret empty, and any destructive DB op
+	// during the gap fails with "agent has not received its per-agent
+	// op-token secret yet". The bootstrap heartbeat closes that window.
+	if reconnect, err := a.tickHeartbeat(ctxWithAuth, client); err != nil {
+		log.Printf("Bootstrap heartbeat failed (will retry on tick): %v", err)
+	} else if reconnect {
+		return nil
+	}
+
 	// Heartbeat loop
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
@@ -292,38 +305,54 @@ func (a *Agent) connect(ctx context.Context) error {
 			a.fastReconnect.Store(true)
 			return nil
 		case <-heartbeatTicker.C:
-			res, err := client.Heartbeat(ctxWithAuth, &pb.HeartbeatRequest{
-				AgentId:   a.agentID,
-				Timestamp: time.Now().Unix(),
-			})
+			reconnect, err := a.tickHeartbeat(ctxWithAuth, client)
 			if err != nil {
-				log.Printf("Heartbeat failed: %v", err)
 				return err
 			}
-
-			updates := res.GetConfigUpdates()
-
-			// Per-agent op-token secret for destructive database operations.
-			// Refreshed on every heartbeat so a server-side rotation
-			// (cert renewal, manual rotate) propagates within one tick. The
-			// secret rides the existing mTLS-protected channel; we never
-			// persist it to disk.
-			if encoded := updates["op_token_secret"]; encoded != "" {
-				if raw, decErr := base64.StdEncoding.DecodeString(encoded); decErr == nil {
-					database.SetOpTokenSecret(raw)
-				} else {
-					log.Printf("Heartbeat: op_token_secret base64 decode failed: %v", decErr)
-				}
-			}
-
-			// Heartbeat-based reconnect signal (fallback when command stream not available)
-			if updates["action"] == "reconnect" {
-				log.Println("Server requested reconnect via heartbeat — fast handoff")
-				a.fastReconnect.Store(true)
+			if reconnect {
 				return nil
 			}
 		}
 	}
+}
+
+// tickHeartbeat sends one heartbeat and applies any config updates the
+// control plane sent back. Returns (reconnect=true, nil) when the panel
+// asked for a fast handoff, (false, err) on transport failure, or
+// (false, nil) on a successful no-op tick.
+func (a *Agent) tickHeartbeat(ctxWithAuth context.Context, client pb.AgentServiceClient) (bool, error) {
+	res, err := client.Heartbeat(ctxWithAuth, &pb.HeartbeatRequest{
+		AgentId:   a.agentID,
+		Timestamp: time.Now().Unix(),
+	})
+	if err != nil {
+		log.Printf("Heartbeat failed: %v", err)
+		return false, err
+	}
+
+	updates := res.GetConfigUpdates()
+
+	// Per-agent op-token secret for destructive database operations.
+	// Refreshed on every heartbeat so a server-side rotation (cert
+	// renewal, manual rotate) propagates within one tick. The secret
+	// rides the existing mTLS-protected channel; we never persist it
+	// to disk.
+	if encoded := updates["op_token_secret"]; encoded != "" {
+		if raw, decErr := base64.StdEncoding.DecodeString(encoded); decErr == nil {
+			database.SetOpTokenSecret(raw)
+		} else {
+			log.Printf("Heartbeat: op_token_secret base64 decode failed: %v", decErr)
+		}
+	}
+
+	// Heartbeat-based reconnect signal (fallback when command stream not available)
+	if updates["action"] == "reconnect" {
+		log.Println("Server requested reconnect via heartbeat — fast handoff")
+		a.fastReconnect.Store(true)
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // runCommandStream handles bidirectional command streaming with retry logic
