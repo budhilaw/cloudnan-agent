@@ -74,16 +74,26 @@ func (h *Handler) opProvisionDumpUserCmd(ctx context.Context, args []string) *Re
 // but pg_dump-as-postgres just works when run by root via sudo
 // switching) so the op is a no-op on Postgres.
 func (h *Handler) opProvisionDumpUser(ctx context.Context, req *provisionDumpUserRequest) (*provisionDumpUserResponse, error) {
-	driver, db, entry, err := h.openInstance(ctx, req.InstanceID)
+	// Prefer socket auth as root for the provision op. ALTER USER
+	// and re-issuing GRANTs both require CREATE USER privilege,
+	// which we deliberately exclude from cloudnan_dump's grant set.
+	// So once the vault has been rotated to cloudnan_dump (first
+	// successful provision), reusing those creds for a re-provision
+	// would fail with "Error 1227: you need CREATE USER privilege".
+	// Socket-as-root sidesteps that — agent runs as OS root, the
+	// unix_socket plugin authenticates by socket peer UID, and root
+	// has CREATE USER (and everything else).
+	driver, db, entry, err := h.openInstanceViaSocket(ctx, req.InstanceID)
 	if err != nil {
-		// The caller commonly hits this op when the existing
-		// credentials don't work (1698). Try a socket fallback as
-		// root with no password — that's what unix_socket / auth_socket
-		// allows when the agent runs as OS root. If that also fails,
-		// surface a clear message.
-		driver2, db2, entry2, sockErr := h.openInstanceViaSocket(ctx, req.InstanceID)
-		if sockErr != nil {
-			return nil, fmt.Errorf("open instance: %w (socket fallback also failed: %v)", err, sockErr)
+		// Socket path unavailable (non-Debian default, instance on a
+		// remote host, or socket file missing). Fall back to vault
+		// creds — re-provisions in this state will fail with 1227 if
+		// the vault holds cloudnan_dump, but the operator can fix
+		// that out-of-band by ALTERing root's auth method back to
+		// password and rerunning.
+		driver2, db2, entry2, vaultErr := h.openInstance(ctx, req.InstanceID)
+		if vaultErr != nil {
+			return nil, fmt.Errorf("open instance via socket: %w (vault fallback also failed: %v)", err, vaultErr)
 		}
 		driver, db, entry = driver2, db2, entry2
 	}
