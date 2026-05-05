@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,16 @@ import (
 
 	pb "github.com/cloudnan-tech/cloudnan-agent/proto/agent"
 )
+
+// localExportRoot is the on-agent directory where Cloudnan-Storage
+// destination dumps land before the control plane fetches them. Kept
+// under /tmp so it's wiped on host reboot — a stale ciphertext lying
+// around from a crashed agent cleans itself up rather than persisting
+// and consuming disk forever. The control plane is responsible for
+// removing per-export files immediately after a successful fetch (the
+// runID-suffixed object key gives every export its own subtree, so a
+// race between two exports can't collide).
+const localExportRoot = "/tmp/cloudnan-dbexport"
 
 // ExportDumpEnvelope is the agent-side payload for export_dump. Wraps the
 // proto request plus pre-resolved destination credentials. The control
@@ -204,27 +215,64 @@ func (h *Handler) opExportDump(ctx context.Context, args []string, emit func(str
 	// the dump tool's snapshot doesn't include our metadata query.
 	totalEstimate := estimateDumpSize(ctx, h, req.GetInstance().GetInstanceId(), engineEnum, req.GetDatabaseNames())
 
-	// ---- 8. open uploader (fails fast on bad S3 creds) ----
-	var uploadedAtomic atomic.Uint64
-	onProgress := func(n uint64) {
-		uploadedAtomic.Store(n)
-	}
-	uploader, err := NewChunkUploader(ctx, &env.Destination, objectKey, onProgress)
-	if err != nil {
-		return emitFailureAndError(emit, fmt.Sprintf("uploader: %v", err))
+	// ---- 8. open sink (fails fast on bad S3 creds, or unwritable local
+	// path for cloudnan) ----
+	//
+	// Branching point between S3-style destinations and Cloudnan
+	// Storage. The pipeline below (gzip → encrypter → sink) is identical
+	// either way; only the byte-destination differs. ChunkUploader
+	// streams to S3 multipart; LocalFileSink writes to /tmp on the agent
+	// host and the control plane fetches it post-COMPLETED. See
+	// internal/database/sink.go for the rationale.
+	var (
+		sink           uploadSink
+		uploadedAtomic atomic.Uint64
+	)
+	if env.Destination.Provider == "cloudnan" {
+		// Local-file sink: control plane post-fetches from this path.
+		// It also forms the COMPLETED object_key the orchestrator uses
+		// to locate the file.
+		localPath := filepath.Join(localExportRoot, objectKey)
+		lfs, err := NewLocalFileSink(localPath)
+		if err != nil {
+			return emitFailureAndError(emit, fmt.Sprintf("local file sink: %v", err))
+		}
+		sink = lfs
+		// LocalFileSink doesn't have an onProgress callback; we sample
+		// Uploaded() from the ticker below. Set the atomic from a
+		// background goroutine so the existing ticker code is unchanged.
+		// One read per progressTickInterval is cheap.
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					uploadedAtomic.Store(lfs.Uploaded())
+					time.Sleep(progressTickInterval / 4)
+				}
+			}
+		}()
+	} else {
+		onProgress := func(n uint64) { uploadedAtomic.Store(n) }
+		cu, err := NewChunkUploader(ctx, &env.Destination, objectKey, onProgress)
+		if err != nil {
+			return emitFailureAndError(emit, fmt.Sprintf("uploader: %v", err))
+		}
+		sink = cu
 	}
 	// Defer abort: only fires if Close was never called or returned an
-	// error. The successful path calls uploader.Close() explicitly and
+	// error. The successful path calls sink.Close() explicitly and
 	// then this defer's Abort() is a no-op (already closed).
 	uploadAborted := false
 	defer func() {
 		if !uploadAborted {
-			_ = uploader.Abort()
+			_ = sink.Abort()
 		}
 	}()
 
-	// ---- 9. wire encrypter on top of uploader ----
-	encrypter, err := NewStreamEncrypter(req.GetEncryptionKey(), uploader)
+	// ---- 9. wire encrypter on top of sink ----
+	encrypter, err := NewStreamEncrypter(req.GetEncryptionKey(), sink)
 	if err != nil {
 		return emitFailureAndError(emit, fmt.Sprintf("encrypter: %v", err))
 	}
@@ -318,31 +366,31 @@ func (h *Handler) opExportDump(ctx context.Context, args []string, emit func(str
 	<-tickerDone
 
 	if copyErr != nil {
-		return finalizeFailure(emit, uploader, &uploadAborted, fmt.Sprintf("pipe copy: %v (dump stderr: %s)", copyErr, stderrCap.String()))
+		return finalizeFailure(emit, sink, &uploadAborted, fmt.Sprintf("pipe copy: %v (dump stderr: %s)", copyErr, stderrCap.String()))
 	}
 	if waitErr != nil {
-		return finalizeFailure(emit, uploader, &uploadAborted, fmt.Sprintf("%s exit: %v (stderr: %s)", program, waitErr, stderrCap.String()))
+		return finalizeFailure(emit, sink, &uploadAborted, fmt.Sprintf("%s exit: %v (stderr: %s)", program, waitErr, stderrCap.String()))
 	}
 
-	// ---- 14. close pipeline in order: gzip -> encrypter -> uploader ----
+	// ---- 14. close pipeline in order: gzip -> encrypter -> sink ----
 	// Each Close flushes its tail; closing them out of order would either
 	// drop unflushed bytes or write to a closed downstream sink.
 	if gzipWriter != nil {
 		if err := gzipWriter.Close(); err != nil {
-			return finalizeFailure(emit, uploader, &uploadAborted, fmt.Sprintf("gzip close: %v", err))
+			return finalizeFailure(emit, sink, &uploadAborted, fmt.Sprintf("gzip close: %v", err))
 		}
 	}
 	if err := encrypter.Close(); err != nil {
-		return finalizeFailure(emit, uploader, &uploadAborted, fmt.Sprintf("encrypter close: %v", err))
+		return finalizeFailure(emit, sink, &uploadAborted, fmt.Sprintf("encrypter close: %v", err))
 	}
-	if err := uploader.Close(); err != nil {
+	if err := sink.Close(); err != nil {
 		uploadAborted = true // Close() already aborted internally on error
-		return emitFailureAndError(emit, fmt.Sprintf("uploader close: %v", err))
+		return emitFailureAndError(emit, fmt.Sprintf("sink close: %v", err))
 	}
 	uploadAborted = true // Close() succeeded; defer-Abort is a no-op now.
 
 	// ---- 15. emit COMPLETED ----
-	finalSize := uploader.Uploaded()
+	finalSize := sink.Uploaded()
 	emitProgress(emit, &pb.DatabaseExportProgress{
 		Phase:              pb.DatabaseExportPhase_DATABASE_EXPORT_PHASE_COMPLETED,
 		BytesProcessed:     finalSize,
@@ -381,12 +429,13 @@ func emitFailureAndError(emit func(string), message string) error {
 	return errors.New(message)
 }
 
-// finalizeFailure emits PHASE_FAILED, aborts the in-flight multipart
-// upload, marks it aborted so the deferred Abort() is a no-op, and
+// finalizeFailure emits PHASE_FAILED, aborts the in-flight sink (S3
+// multipart abort or local-file removal depending on which sink is
+// active), marks it aborted so the deferred Abort() is a no-op, and
 // returns the error.
-func finalizeFailure(emit func(string), uploader *ChunkUploader, aborted *bool, message string) error {
-	if uploader != nil && aborted != nil && !*aborted {
-		_ = uploader.Abort()
+func finalizeFailure(emit func(string), sink uploadSink, aborted *bool, message string) error {
+	if sink != nil && aborted != nil && !*aborted {
+		_ = sink.Abort()
 		*aborted = true
 	}
 	emitProgress(emit, &pb.DatabaseExportProgress{
