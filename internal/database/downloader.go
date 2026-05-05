@@ -157,6 +157,14 @@ func (d *ChunkDownloader) Downloaded() uint64 {
 	return d.read.Load()
 }
 
+// TotalBytes returns the object's content length as reported by S3
+// HEAD. Implements the readerSource contract so the restore pipeline
+// can swap between ChunkDownloader and LocalFileSource without
+// per-source branching at the progress-reporting layer.
+func (d *ChunkDownloader) TotalBytes() uint64 {
+	return d.Total
+}
+
 // Close releases the underlying HTTP response body. Idempotent: a second
 // Close is a no-op. Always call this from a defer in the orchestrator,
 // regardless of whether the read completed successfully.

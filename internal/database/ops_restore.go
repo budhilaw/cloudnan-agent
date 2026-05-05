@@ -50,12 +50,21 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sync/atomic"
 	"time"
 
 	pb "github.com/cloudnan-tech/cloudnan-agent/proto/agent"
 )
+
+// localRestoreRoot is the on-agent directory where the control plane
+// pre-pushes Cloudnan-Storage-sourced ciphertext before dispatching
+// the restore command. Mirror of localExportRoot but per-direction so
+// an export running concurrently with a restore on the same agent
+// can't collide on filenames. /tmp so files self-clean on reboot if
+// our explicit cleanup ever fails.
+const localRestoreRoot = "/tmp/cloudnan-dbrestore"
 
 // RestoreDumpEnvelope is the agent payload for restore_dump. Mirrors
 // ExportDumpEnvelope's structure (proto request + non-proto destination)
@@ -181,7 +190,10 @@ func (h *Handler) opRestoreDump(ctx context.Context, args []string, emit func(st
 	if env.SourceObjectKey == "" {
 		return emitRestoreFailureAndError(emit, target, "source_object_key is required")
 	}
-	if env.Destination.Bucket == "" {
+	// Bucket is mandatory for S3-style sources but explicitly empty for
+	// Cloudnan Storage (the source is a local file the control plane
+	// pre-pushed; there's no S3 endpoint). Validate per-provider.
+	if env.Destination.Provider != "cloudnan" && env.Destination.Bucket == "" {
 		return emitRestoreFailureAndError(emit, target, "destination is required")
 	}
 
@@ -243,14 +255,32 @@ func (h *Handler) opRestoreDump(ctx context.Context, args []string, emit func(st
 		_ = dropRestoreTarget(dropCtx, driver.Engine(), db, target)
 	}()
 
-	// ---- 6. open downloader ----
-	downloader, err := NewChunkDownloader(ctx, &env.Destination, env.SourceObjectKey)
-	if err != nil {
-		return emitRestoreFailureAndError(emit, target, fmt.Sprintf("downloader: %v", err))
+	// ---- 6. open ciphertext source ----
+	// Branch by provider: S3-style downloads from the cloud bucket;
+	// Cloudnan Storage opens a local file the control plane pre-pushed
+	// to /tmp/cloudnan-dbrestore/<key>. The pipeline below
+	// (decrypter → gunzip → restorer) is identical for both.
+	var (
+		source        readerSource
+		totalEstimate uint64
+	)
+	if env.Destination.Provider == "cloudnan" {
+		localPath := filepath.Join(localRestoreRoot, env.SourceObjectKey)
+		lfs, err := NewLocalFileSource(localPath)
+		if err != nil {
+			return emitRestoreFailureAndError(emit, target, fmt.Sprintf("local source: %v", err))
+		}
+		source = lfs
+		totalEstimate = lfs.TotalBytes()
+	} else {
+		downloader, err := NewChunkDownloader(ctx, &env.Destination, env.SourceObjectKey)
+		if err != nil {
+			return emitRestoreFailureAndError(emit, target, fmt.Sprintf("downloader: %v", err))
+		}
+		source = downloader
+		totalEstimate = downloader.Total
 	}
-	defer func() { _ = downloader.Close() }()
-
-	totalEstimate := downloader.Total
+	defer func() { _ = source.Close() }()
 
 	emitRestoreProgress(emit, &RestoreProgressEvent{
 		Phase:              restorePhaseDownloading,
@@ -258,8 +288,8 @@ func (h *Handler) opRestoreDump(ctx context.Context, args []string, emit func(st
 		TargetDatabase:     target,
 	})
 
-	// ---- 7. wire decrypter on top of downloader ----
-	decrypter, err := NewStreamDecrypter(env.EncryptionKey, downloader)
+	// ---- 7. wire decrypter on top of source ----
+	decrypter, err := NewStreamDecrypter(env.EncryptionKey, source)
 	if err != nil {
 		return emitRestoreFailureAndError(emit, target, fmt.Sprintf("decrypter: %v", err))
 	}
@@ -316,7 +346,7 @@ func (h *Handler) opRestoreDump(ctx context.Context, args []string, emit func(st
 
 	// pipedAtomic counts plaintext bytes successfully delivered to the
 	// restore subprocess's stdin. We separately track the downloaded
-	// (ciphertext) byte count via downloader.Downloaded(); the frontend
+	// (ciphertext) byte count via source.Downloaded(); the frontend
 	// can compute a percentage off either, but ciphertext is the
 	// canonical "how much of the S3 object have we consumed" and lines
 	// up with totalEstimate, so that's what we report.
@@ -334,7 +364,7 @@ func (h *Handler) opRestoreDump(ctx context.Context, args []string, emit func(st
 			case <-ticker.C:
 				emitRestoreProgress(emit, &RestoreProgressEvent{
 					Phase:              restorePhaseRestoring,
-					BytesProcessed:     downloader.Downloaded(),
+					BytesProcessed:     source.Downloaded(),
 					BytesTotalEstimate: totalEstimate,
 					TargetDatabase:     target,
 				})
@@ -389,7 +419,7 @@ func (h *Handler) opRestoreDump(ctx context.Context, args []string, emit func(st
 
 	// ---- 12. mark success + emit COMPLETED ----
 	restoreSucceeded = true
-	finalBytes := downloader.Downloaded()
+	finalBytes := source.Downloaded()
 	emitRestoreProgress(emit, &RestoreProgressEvent{
 		Phase:              restorePhaseCompleted,
 		BytesProcessed:     finalBytes,
