@@ -6,10 +6,63 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
+
+// hardBlockPatterns are regular expressions that match catastrophically
+// destructive shell idioms regardless of how the command was assembled.
+// Even if the AI generates one, even if the operator typed one, even
+// if the control plane (somehow) wraps one — the agent refuses. These
+// are NOT user-tunable: the regexes intentionally live in source so a
+// misconfigured config.yaml can't accidentally re-enable them.
+//
+// Each pattern is matched case-insensitively against the full assembled
+// command line. False positives are fine — the right answer to "what
+// if I really need to run mkfs" is "use a dedicated tool with typed
+// schemas," not "loosen the agent guard."
+var hardBlockPatterns = []*regexp.Regexp{
+	// Filesystem nukes — any rm of /, /etc, /usr, /bin, /sbin, /lib,
+	// /var, /home (top-level). We deliberately accept rm of
+	// subpaths under those, e.g. /var/log/old.log is fine. The lazy
+	// fillers ([^|;&\n]*?) tolerate flag reordering and the
+	// --no-preserve-root option appearing in any position.
+	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[a-zA-Z]*[rR][a-zA-Z]*[fF][a-zA-Z]*[^|;&\n]*?\s/(?:\s|$|['"])`),
+	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[a-zA-Z]*[fF][a-zA-Z]*[rR][a-zA-Z]*[^|;&\n]*?\s/(?:\s|$|['"])`),
+	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[rRfFa]+[^|;&\n]*?\s/(?:etc|usr|bin|sbin|lib|lib64|boot|var|home|root)(?:[/\s'"]|$)`),
+	// dd to a raw block device (nukes the disk). We let dd to files
+	// pass — that's a legitimate fallocate alternative.
+	regexp.MustCompile(`(?i)\bdd\b[^|;&\n]*\bof=/dev/(?:sd[a-z]+|nvme|vd[a-z]+|xvd[a-z]+|disk\d+)`),
+	// mkfs against a real disk (not a loop device or image file).
+	regexp.MustCompile(`(?i)\bmkfs(?:\.[a-z0-9]+)?\s+/dev/(?:sd[a-z]+|nvme|vd[a-z]+|xvd[a-z]+|disk\d+)`),
+	regexp.MustCompile(`(?i)\bwipefs\s+(-[a-z]*\s+)*/dev/`),
+	regexp.MustCompile(`(?i)\bshred\s+(-[a-z]*\s+)*/dev/`),
+	// Fork bomb (classic + variants).
+	regexp.MustCompile(`:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:`),
+	// > /dev/sda style direct writes to disk devices.
+	regexp.MustCompile(`>\s*/dev/(?:sd[a-z]+|nvme|vd[a-z]+|xvd[a-z]+|disk\d+)`),
+	// chmod 777 / 000 on the entire root or critical system dirs.
+	regexp.MustCompile(`(?i)\bchmod\s+(-R\s+)?(?:000|777)\s+/(?:\s|$|etc|usr|bin|sbin|lib|lib64|boot|var)`),
+	// chown changing ownership of /etc, /usr, /boot — almost always wrong.
+	regexp.MustCompile(`(?i)\bchown\s+(-R\s+)?[a-zA-Z0-9._:-]+\s+/(?:etc|usr|boot|sbin|bin|lib|lib64)\s*(\s|$)`),
+	// Disabling sudo, deleting /etc/sudoers, deleting authorized_keys.
+	regexp.MustCompile(`(?i)\brm\s+(-[a-z]*\s+)*/etc/sudoers(\.d)?\b`),
+	regexp.MustCompile(`(?i)>\s*/etc/sudoers\b`),
+	regexp.MustCompile(`(?i)\brm\s+(-[a-z]*\s+)*[^\s]*/\.ssh/authorized_keys\b`),
+	// Halting the agent's own host.
+	regexp.MustCompile(`(?i)\b(?:shutdown|poweroff|halt|reboot|init\s+0|init\s+6|telinit\s+0|telinit\s+6)\b`),
+	// Disabling/removing the cloudnan agent itself.
+	regexp.MustCompile(`(?i)\bsystemctl\s+(?:disable|stop|mask)\s+cloudnan-agent\b`),
+	regexp.MustCompile(`(?i)\b(?:apt(?:-get)?|yum|dnf|zypper)\s+(?:remove|purge|erase)\s+(?:[^&;|]*\s+)?cloudnan-agent\b`),
+	// Curl-piping arbitrary internet shell scripts into root.
+	regexp.MustCompile(`(?i)\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|ksh)\b`),
+	// iptables -F flush (would drop all firewall rules) — UFW path is
+	// preferred and our tools wrap it; raw iptables -F is almost
+	// always a sign of a confused agent.
+	regexp.MustCompile(`(?i)\biptables\s+(-[A-Za-z]*\s+)*-F\b`),
+}
 
 // Executor handles command execution on the agent
 type Executor struct {
@@ -220,8 +273,17 @@ func (e *Executor) streamPipe(wg *sync.WaitGroup, pipe io.ReadCloser, buf *bytes
 }
 
 func (e *Executor) isBlocked(cmd string) bool {
+	// Hard blocks first — these are baked-in catastrophes that no
+	// configuration can re-enable. Even a malicious or misconfigured
+	// control plane sending these gets rejected at the agent.
+	for _, re := range hardBlockPatterns {
+		if re.MatchString(cmd) {
+			return true
+		}
+	}
 	cmdLower := strings.ToLower(cmd)
-	// Check configured blocked patterns
+	// Check configured blocked patterns (substring match — keep
+	// existing behaviour so config.yaml additions still work).
 	for _, blocked := range e.blockedCommands {
 		if strings.Contains(cmdLower, strings.ToLower(blocked)) {
 			return true
@@ -234,6 +296,20 @@ func (e *Executor) isBlocked(cmd string) bool {
 	// belongs to the configured allowedCommands/blockedCommands lists, not to
 	// a blanket interpreter ban that would break most agent operations.
 	return false
+}
+
+// MatchedHardBlock returns the first hard-block pattern (as a string)
+// that matched the command, or empty string. Exported for tests and
+// for richer agent logs ("blocked: rm-of-root pattern" instead of
+// just "blocked"). Used by callers that want to report *why* a command
+// was rejected rather than just that it was.
+func MatchedHardBlock(cmd string) string {
+	for _, re := range hardBlockPatterns {
+		if re.MatchString(cmd) {
+			return re.String()
+		}
+	}
+	return ""
 }
 
 func (e *Executor) isAllowed(cmd string) bool {
