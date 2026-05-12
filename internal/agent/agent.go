@@ -1207,6 +1207,16 @@ func (a *Agent) executeFileCommand(args []string) *executor.Result {
 		}
 		result.Stdout = "File copied successfully"
 
+	case "ai_backup":
+		// Snapshot a target without mutating it. The "prepare" step
+		// in the two-step approval flow — the user sees what will
+		// be backed up + approves; then a separate "commit" call
+		// applies the actual mutation.
+		// args[1] = invocation_id, args[2] = abs_path
+		runAIFile(result, args, 3, func() (*filesystem.BackupInfo, error) {
+			return a.fsManager.AIBackup(args[1], args[2])
+		})
+
 	case "ai_write":
 		// AI write with backup-first semantics.
 		// args[1] = invocation_id, args[2] = abs_path, args[3] = base64_content

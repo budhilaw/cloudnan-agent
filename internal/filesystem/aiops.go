@@ -151,6 +151,34 @@ type AIDeleteRequest struct {
 	Recursive bool
 }
 
+// AIBackup captures a snapshot of the target path WITHOUT mutating
+// it. Returned by prepare_X tools so the user sees an explicit
+// "backed up" confirmation card BEFORE the destructive action runs.
+//
+// SECURITY: still runs through resolveForAI so the blocklist is
+// enforced even for backup-only paths — we don't want a "preview"
+// tool to leak credentials by reading /etc/shadow.
+func (m *Manager) AIBackup(invocationID, path string) (*BackupInfo, error) {
+	if invocationID == "" {
+		return nil, errors.New("invocation_id required")
+	}
+	abs, err := m.resolveForAI(path, false /*must exist*/)
+	if err != nil {
+		// Allow the target to be absent — prepare-for-create needs
+		// to record "nothing to back up" so commit knows the
+		// rollback is `rm -f`.
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		abs2, rErr := m.resolveForAI(path, true /*allow missing*/)
+		if rErr != nil {
+			return nil, rErr
+		}
+		abs = abs2
+	}
+	return m.captureBackup(invocationID, abs)
+}
+
 // AIWrite creates or overwrites a file. Returns BackupInfo with the
 // recipe to restore the previous content (or `rm` for fresh
 // creates).
