@@ -744,16 +744,38 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 		return
 
 	case pb.CommandType_COMMAND_TYPE_EXEC:
-		// Pass the command + its args separately so the executor can quote
-		// each arg properly. Joining them with spaces destroys quoting and
-		// breaks any args containing spaces (e.g. `sh -c "sudo wg show wg0"`
-		// would become `sh -c sudo wg show wg0`, where sh receives only
-		// "sudo" as the -c command and the rest become shell positional
-		// args — making sudo error out with "missing command").
-		if len(cmd.Args) == 0 {
-			result, execErr = a.executor.Execute(execCtx, "", nil, nil, timeout)
+		// Internal-routed self-management sentinels. The control plane
+		// asks the agent to upgrade or uninstall ITSELF via these — and
+		// both operations have to do things the executor's hard-block
+		// regex explicitly refuses for user-issued commands (curl |
+		// bash, systemctl disable cloudnan-agent). Routing through a
+		// dedicated agent-internal path means the hard-block stays
+		// strict for everything else.
+		//
+		// SECURITY: gRPC is mTLS-locked, so only an authenticated
+		// control plane can deliver these sentinels. A compromised LLM
+		// cannot synthesize them — the orchestrator never emits the
+		// sentinel string from its tool surface; the only emitter is
+		// the BE's case "update" / case "UNINSTALL" command builder.
+		if len(cmd.Args) > 0 {
+			switch cmd.Args[0] {
+			case sentinelSelfUpdate:
+				result, execErr = a.runSelfUpdate(execCtx, timeout)
+			case sentinelSelfUninstall:
+				result, execErr = a.runSelfUninstall(execCtx, timeout)
+			default:
+				// Pass the command + its args separately so the
+				// executor can quote each arg properly. Joining them
+				// with spaces destroys quoting and breaks any args
+				// containing spaces (e.g. `sh -c "sudo wg show wg0"`
+				// would become `sh -c sudo wg show wg0`, where sh
+				// receives only "sudo" as the -c command and the
+				// rest become shell positional args — making sudo
+				// error out with "missing command").
+				result, execErr = a.executor.Execute(execCtx, cmd.Args[0], cmd.Args[1:], nil, timeout)
+			}
 		} else {
-			result, execErr = a.executor.Execute(execCtx, cmd.Args[0], cmd.Args[1:], nil, timeout)
+			result, execErr = a.executor.Execute(execCtx, "", nil, nil, timeout)
 		}
 
 	case pb.CommandType_COMMAND_TYPE_DOCKER:
@@ -1357,4 +1379,88 @@ func (a *Agent) checkModules(moduleIDs []string) *executor.Result {
 
 	result.FinishedAt = time.Now()
 	return result
+}
+
+// ── self-management sentinels ────────────────────────────────────
+//
+// The control plane delivers self-update / self-uninstall as a
+// COMMAND_TYPE_EXEC whose Args[0] is one of these sentinel strings.
+// The dispatcher upstream of the executor recognises the sentinel
+// and routes to runSelfUpdate / runSelfUninstall — bypassing the
+// hard-block regex that (correctly) refuses curl-pipe-bash and
+// systemctl-stop-cloudnan-agent for any user-issued command.
+const (
+	sentinelSelfUpdate    = "__cloudnan_self_update__"
+	sentinelSelfUninstall = "__cloudnan_self_uninstall__"
+)
+
+// runSelfUpdate downloads the current install script from the
+// canonical Cloudnan URL and runs it with --upgrade. This intentionally
+// uses the curl-pipe-bash idiom the user-command executor refuses —
+// we trust the cloudnan.com origin (mTLS-pinned in the install
+// script itself) for our own self-update, and the sentinel routing
+// makes it impossible for an LLM-generated tool call to reach this
+// code path.
+func (a *Agent) runSelfUpdate(ctx context.Context, timeout time.Duration) (*executor.Result, error) {
+	const url = "https://cloudnan.com/downloads/install.sh"
+	script := fmt.Sprintf(
+		"set -e\ncurl -sSL %q | sudo bash -s -- --upgrade",
+		url,
+	)
+	return a.runShellInternal(ctx, script, timeout)
+}
+
+// runSelfUninstall stops the agent service, disables it from boot,
+// removes the binary + systemd unit + config. Lives behind the
+// sentinel for the same reason as runSelfUpdate — the hard-block
+// regex correctly refuses any user-issued `systemctl stop cloudnan-
+// agent`, but the agent's own legitimate self-removal path needs
+// to do exactly that.
+func (a *Agent) runSelfUninstall(ctx context.Context, timeout time.Duration) (*executor.Result, error) {
+	// Fork the actual cleanup into background so the agent's gRPC
+	// stream can return COMPLETED to the control plane BEFORE
+	// systemd kills the process out from under us. Without the
+	// detached background, the agent dies mid-response and the
+	// control plane sees an aborted stream instead of a clean
+	// "uninstall scheduled" ack.
+	script := "nohup bash -c '" +
+		"sleep 3 && " +
+		"systemctl stop cloudnan-agent 2>/dev/null; " +
+		"systemctl disable cloudnan-agent 2>/dev/null; " +
+		"rm -f /etc/systemd/system/cloudnan-agent.service; " +
+		"systemctl daemon-reload 2>/dev/null; " +
+		"rm -f /usr/local/bin/cloudnan-agent; " +
+		"rm -rf /etc/cloudnan" +
+		"' >/dev/null 2>&1 & echo 'Uninstall scheduled'"
+	return a.runShellInternal(ctx, script, timeout)
+}
+
+// runShellInternal runs a shell command DIRECTLY via os/exec,
+// skipping the executor's hard-block regex. Reserved for the two
+// sentinel paths above — every other code path on the agent must
+// go through executor.Execute so the safety guards remain in
+// effect.
+func (a *Agent) runShellInternal(ctx context.Context, script string, timeout time.Duration) (*executor.Result, error) {
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	c := exec.CommandContext(cctx, "/bin/sh", "-c", script)
+	out, err := c.CombinedOutput()
+	result := &executor.Result{
+		StartedAt:  time.Now(),
+		Stdout:     string(out),
+		FinishedAt: time.Now(),
+	}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.ExitCode = -1
+			result.Error = err
+		}
+		return result, err
+	}
+	return result, nil
 }
