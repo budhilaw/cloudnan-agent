@@ -89,6 +89,12 @@ func New(cfg *config.Config, version string) (*Agent, error) {
 	fsManager := filesystem.New("/")
 	dbHandler := database.NewHandler()
 
+	// Start the AI backup janitor — prunes /var/backups/cloudnan
+	// entries older than 30 days, evicts oldest first when the total
+	// exceeds 1 GiB. Runs in its own goroutine for the lifetime of
+	// the agent process.
+	filesystem.StartBackupJanitor("")
+
 	return &Agent{
 		cfg:         cfg,
 		executor:    exec,
@@ -1049,6 +1055,31 @@ func (a *Agent) executeSSHCommand(operation string, args []string) *executor.Res
 	return result
 }
 
+// runAIFile is a tiny adapter so each ai_* arm reads the same:
+// validate the arg count, run the closure, surface either the
+// BackupInfo or the error onto the executor.Result. Centralizing
+// the boilerplate keeps the switch arms readable.
+func runAIFile(result *executor.Result, args []string, minArgs int, op func() (*filesystem.BackupInfo, error)) {
+	if len(args) < minArgs {
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("ai_%s requires at least %d args, got %d", args[0], minArgs, len(args))
+		return
+	}
+	info, err := op()
+	if err != nil {
+		result.ExitCode = 1
+		result.Stderr = err.Error()
+		return
+	}
+	b, mErr := json.Marshal(info)
+	if mErr != nil {
+		result.ExitCode = 1
+		result.Stderr = "marshal backup info: " + mErr.Error()
+		return
+	}
+	result.Stdout = string(b)
+}
+
 // executeFileCommand handles File operations
 func (a *Agent) executeFileCommand(args []string) *executor.Result {
 	result := &executor.Result{
@@ -1175,6 +1206,53 @@ func (a *Agent) executeFileCommand(args []string) *executor.Result {
 			return result
 		}
 		result.Stdout = "File copied successfully"
+
+	case "ai_write":
+		// AI write with backup-first semantics.
+		// args[1] = invocation_id, args[2] = abs_path, args[3] = base64_content
+		// Returns BackupInfo (JSON) on stdout so the BE can persist it
+		// as rollback_recipe + render mode/uid/gid/sha256 on the
+		// approval card. Distinct from "write" / "write_base64" so the
+		// hardened (blocklisted, atomic, backup-capturing) path can't
+		// be confused with the legacy file-browser writer.
+		runAIFile(result, args, 4, func() (*filesystem.BackupInfo, error) {
+			data, decErr := base64.StdEncoding.DecodeString(args[3])
+			if decErr != nil {
+				return nil, fmt.Errorf("invalid base64: %v", decErr)
+			}
+			return a.fsManager.AIWrite(filesystem.AIWriteRequest{
+				InvocationID: args[1],
+				AbsPath:      args[2],
+				Content:      data,
+			})
+		})
+
+	case "ai_edit":
+		// args[1] = invocation_id, args[2] = abs_path,
+		// args[3] = old_string (raw), args[4] = new_string (raw),
+		// args[5] = "1" for replace_all (optional, default "0").
+		runAIFile(result, args, 5, func() (*filesystem.BackupInfo, error) {
+			replaceAll := len(args) >= 6 && args[5] == "1"
+			return a.fsManager.AIEdit(filesystem.AIEditRequest{
+				InvocationID: args[1],
+				AbsPath:      args[2],
+				OldString:    args[3],
+				NewString:    args[4],
+				ReplaceAll:   replaceAll,
+			})
+		})
+
+	case "ai_delete":
+		// args[1] = invocation_id, args[2] = abs_path,
+		// args[3] = "1" for recursive (required for directories).
+		runAIFile(result, args, 3, func() (*filesystem.BackupInfo, error) {
+			recursive := len(args) >= 4 && args[3] == "1"
+			return a.fsManager.AIDelete(filesystem.AIDeleteRequest{
+				InvocationID: args[1],
+				AbsPath:      args[2],
+				Recursive:    recursive,
+			})
+		})
 
 	default:
 		result.ExitCode = 1
