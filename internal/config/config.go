@@ -84,7 +84,45 @@ func Load(path string) (*Config, error) {
 	// Set defaults
 	cfg.setDefaults()
 
+	// One-time sanitizer for the historical default
+	// BlockedCommands. Old agent.yaml files in the wild contain
+	// entries like "rm -rf /", "rm -rf /*", "chown -R" — all
+	// substring matchers that catch any legitimate cleanup
+	// command containing the dangerous bytes as a substring.
+	// The hardBlockPatterns in executor.go already cover the
+	// catastrophic cases with anchored regex; the substring list
+	// was redundant + harmful. Strip the known false-positives so
+	// existing droplets stop blocking install_wordpress / deploy
+	// flows on every restart without operator intervention.
+	cfg.Executor.BlockedCommands = stripKnownBadBlocklist(cfg.Executor.BlockedCommands)
+
 	return cfg, nil
+}
+
+// stripKnownBadBlocklist removes substring-match entries that
+// historically false-positived legitimate install commands. The
+// equivalent anchored regex check lives in executor.hardBlockPatterns
+// — operators can re-add custom entries via agent.yaml if they
+// want stricter restrictions; we just don't ship the bad defaults.
+func stripKnownBadBlocklist(blocked []string) []string {
+	badDefaults := map[string]bool{
+		"rm -rf /":        true,
+		"rm -rf /*":       true,
+		"chown -R":        true,
+		"chmod -R 777 /":  true,
+		"mkfs":            true,
+		"dd if=/dev/zero": true,
+		"> /dev/sda":      true,
+		":(){ :|:& };:":   true,
+	}
+	out := make([]string, 0, len(blocked))
+	for _, b := range blocked {
+		if badDefaults[b] {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 func (c *Config) setDefaults() {
@@ -165,19 +203,36 @@ func CreateDefault() *Config {
 			StreamToControlPlane: true,
 		},
 		Executor: ExecutorConfig{
-			Shell:           "/bin/bash",
-			DefaultTimeout:  5 * time.Minute,
+			Shell:          "/bin/bash",
+			DefaultTimeout: 5 * time.Minute,
+			// AllowedCommands empty = allow-all; agent then relies
+			// on the anchored regex hardBlockPatterns in executor.go
+			// for actual safety.
 			AllowedCommands: []string{},
-			BlockedCommands: []string{
-				"rm -rf /",
-				"rm -rf /*",
-				"mkfs",
-				":(){ :|:& };:",     // fork bomb
-				"> /dev/sda",         // disk wipe
-				"dd if=/dev/zero",    // disk wipe
-				"chmod -R 777 /",     // permission bomb
-				"chown -R",
-			},
+			// BlockedCommands is INTENTIONALLY EMPTY by default.
+			//
+			// The agent's executor.isBlocked() does substring
+			// matching on this list, which catches every false-
+			// positive imaginable: "rm -rf /" matches "rm -rf
+			// /tmp/foo", "chown -R" matches "chown -R user
+			// /var/www/site", and so on. The control plane's
+			// install_wordpress / install_app flows kept failing
+			// because legitimate cleanup commands literally
+			// contain the dangerous substrings.
+			//
+			// The CATASTROPHIC cases (rm -rf of root system dirs,
+			// mkfs against real disks, fork bombs, > /dev/sd*,
+			// chown of /etc /usr /boot, curl|sh, shutdown,
+			// uninstalling cloudnan-agent itself) are all covered
+			// by hardBlockPatterns in executor.go via PROPERLY
+			// ANCHORED regex. Those are immutable + baked into
+			// the binary; no operator can disable them. The
+			// config-level list here is redundant.
+			//
+			// Operators with stricter needs can still add their
+			// own entries via agent.yaml; the substring matcher
+			// still works, just isn't pre-populated with traps.
+			BlockedCommands: []string{},
 		},
 	}
 

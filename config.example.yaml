@@ -83,10 +83,16 @@ executor:
   # Default command timeout (0 = no limit)
   default_timeout: 300s
   
-  # Allowed command prefixes (empty = allow all)
+  # Allowed command prefixes (empty = allow all). The agent relies
+  # on the anchored regex hard-block patterns in executor.go for
+  # safety — those cover catastrophic cases (rm -rf /etc, mkfs
+  # against real disks, fork bombs, curl|sh, shutting down the
+  # agent's own host, etc.) and are immutable.
   allowed_commands: []
-  
-  # Blocked command prefixes
-  blocked_commands:
-    - "rm -rf /"
-    - "mkfs"
+
+  # Extra blocked substrings on top of the hard-blocks. EMPTY BY
+  # DEFAULT. The matcher uses substring + case-insensitive Contains,
+  # so be careful — "rm -rf /" matches "rm -rf /tmp/anything" too.
+  # If you set entries here, anchor them to the EXACT shape you
+  # want to refuse, not a generic verb.
+  blocked_commands: []
