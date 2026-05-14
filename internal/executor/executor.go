@@ -273,28 +273,34 @@ func (e *Executor) streamPipe(wg *sync.WaitGroup, pipe io.ReadCloser, buf *bytes
 }
 
 func (e *Executor) isBlocked(cmd string) bool {
-	// Hard blocks first — these are baked-in catastrophes that no
-	// configuration can re-enable. Even a malicious or misconfigured
-	// control plane sending these gets rejected at the agent.
+	// Anchored regex catastrophes only — these are baked-in patterns
+	// that no configuration can re-enable. Even a malicious or
+	// misconfigured control plane sending these gets rejected.
 	for _, re := range hardBlockPatterns {
 		if re.MatchString(cmd) {
 			return true
 		}
 	}
-	cmdLower := strings.ToLower(cmd)
-	// Check configured blocked patterns (substring match — keep
-	// existing behaviour so config.yaml additions still work).
-	for _, blocked := range e.blockedCommands {
-		if strings.Contains(cmdLower, strings.ToLower(blocked)) {
-			return true
-		}
-	}
+	// The user-configured BlockedCommands substring matcher was
+	// removed deliberately. It used strings.Contains, which means any
+	// legitimate cleanup command containing a dangerous substring got
+	// rejected — "rm -rf /tmp/wp-latest.zip" matched "rm -rf /",
+	// "chown -R www-data /var/www" matched "chown -R", etc. This
+	// false-positived every install_wordpress / deploy_from_github
+	// run on droplets that still had the historical default blocklist
+	// in agent.yaml. The hard-block regex above covers the genuinely
+	// catastrophic shapes (rm of /etc, mkfs of disks, fork bombs,
+	// curl|sh, shutdown, uninstall cloudnan-agent) with anchored
+	// patterns that don't false-positive. Operators wanting stricter
+	// custom rules can request a regex-based config field in a future
+	// release — substring matching is dead.
+	_ = e.blockedCommands
 	// Note: We deliberately do NOT block "sh -c" / "bash -c" here. The control
 	// plane wraps multi-token commands in `sh -c "..."` as a normal protocol
 	// (e.g. `sudo wg show interfaces`, pipes, redirects). The control plane is
 	// the only authenticated caller and is trusted; per-command authorization
-	// belongs to the configured allowedCommands/blockedCommands lists, not to
-	// a blanket interpreter ban that would break most agent operations.
+	// belongs to the anchored hardBlockPatterns above, not to a blanket
+	// interpreter ban that would break most agent operations.
 	return false
 }
 
