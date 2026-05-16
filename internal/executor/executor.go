@@ -31,7 +31,14 @@ var hardBlockPatterns = []*regexp.Regexp{
 	// --no-preserve-root option appearing in any position.
 	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[a-zA-Z]*[rR][a-zA-Z]*[fF][a-zA-Z]*[^|;&\n]*?\s/(?:\s|$|['"])`),
 	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[a-zA-Z]*[fF][a-zA-Z]*[rR][a-zA-Z]*[^|;&\n]*?\s/(?:\s|$|['"])`),
-	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[rRfFa]+[^|;&\n]*?\s/(?:etc|usr|bin|sbin|lib|lib64|boot|var|home|root)(?:[/\s'"]|$)`),
+	// Block rm of a top-level system dir itself (with or without
+	// trailing slash). Subpath rm under those dirs is allowed —
+	// `rm -f /usr/local/bin/node` (the App Installer's uninstall
+	// command for mise-managed binaries) and `rm -rf /var/log/old.
+	// log` are routine operations. The `/?(\s|$|['"])` clause
+	// matches exactly "/usr" or "/usr/" followed by end-of-token,
+	// not a deeper path like "/usr/local/...".
+	regexp.MustCompile(`(?i)\brm\b[^|;&\n]*?-[rRfFa]+[^|;&\n]*?\s/(?:etc|usr|bin|sbin|lib|lib64|boot|var|home|root)/?(?:\s|$|['"])`),
 	// dd to a raw block device (nukes the disk). We let dd to files
 	// pass — that's a legitimate fallocate alternative.
 	regexp.MustCompile(`(?i)\bdd\b[^|;&\n]*\bof=/dev/(?:sd[a-z]+|nvme|vd[a-z]+|xvd[a-z]+|disk\d+)`),
