@@ -420,6 +420,32 @@ func (m *Manager) captureBackup(invocationID, abs string) (*BackupInfo, error) {
 		info.Mode = uint32(st.Mode().Perm())
 	}
 	info.Size = st.Size()
+
+	// Symlinks (including broken ones) get backed up as their TARGET
+	// STRING, not by reading the file they point to. Without this
+	// branch the regular-file path below calls os.Open which follows
+	// the link and fails with 'no such file or directory' when the
+	// target is gone — common when ai_delete is cleaning up an
+	// orphaned nginx sites-enabled entry whose sites-available file
+	// was already removed.
+	//
+	// The rollback recipe re-creates the symlink. Restoration of a
+	// broken symlink is intentional: the operator's intent on
+	// rollback is "put it back exactly the way it was," which
+	// includes the broken-pointer state.
+	if st.Mode()&os.ModeSymlink != 0 {
+		target, lerr := os.Readlink(abs)
+		if lerr != nil {
+			return nil, fmt.Errorf("readlink for backup: %w", lerr)
+		}
+		info.Size = int64(len(target))
+		// No backup file on disk — the recipe carries the target
+		// directly. BackupPath stays empty; the BE renders that as
+		// "no content to back up (symlink)" on the approval card.
+		info.Recipe = fmt.Sprintf("ln -sfn %s %s", shellQuote(target), shellQuote(abs))
+		return info, nil
+	}
+
 	// Refuse to back up massive trees that would blow the disk
 	// budget on their own.
 	if st.IsDir() {
