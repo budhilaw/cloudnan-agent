@@ -57,6 +57,16 @@ type Agent struct {
 	// reconnectCh signals the heartbeat loop to exit immediately and trigger
 	// a fast reconnect. Written by executeCommand on COMMAND_TYPE_RECONNECT.
 	reconnectCh chan struct{}
+
+	// lastHeartbeatRttMs is the round-trip time of the PREVIOUS
+	// Heartbeat RPC, in milliseconds, reported on the NEXT one so
+	// the control plane can surface live latency on the Managed VM
+	// detail page. Self-measured against a single clock so it stays
+	// accurate regardless of NTP drift between this box and the BE.
+	// 0 = first heartbeat of the session (no prior sample). Atomic
+	// so the heartbeat goroutine can update it without locking the
+	// main agent mutex (the tick is on the hot path).
+	lastHeartbeatRttMs atomic.Int32
 }
 
 // New creates a new Agent
@@ -326,15 +336,35 @@ func (a *Agent) connect(ctx context.Context) error {
 // control plane sent back. Returns (reconnect=true, nil) when the panel
 // asked for a fast handoff, (false, err) on transport failure, or
 // (false, nil) on a successful no-op tick.
+//
+// Self-measures the round-trip latency of this Heartbeat RPC and
+// stashes it on the agent so the NEXT tickHeartbeat can report it via
+// HeartbeatRequest.LastRttMs. Single-clock measurement so it's
+// accurate regardless of NTP drift between this box and the control
+// plane.
 func (a *Agent) tickHeartbeat(ctxWithAuth context.Context, client pb.AgentServiceClient) (bool, error) {
+	hbStart := time.Now()
 	res, err := client.Heartbeat(ctxWithAuth, &pb.HeartbeatRequest{
 		AgentId:   a.agentID,
 		Timestamp: time.Now().Unix(),
+		LastRttMs: a.lastHeartbeatRttMs.Load(),
 	})
 	if err != nil {
 		log.Printf("Heartbeat failed: %v", err)
 		return false, err
 	}
+	// Record this RPC's RTT for the NEXT heartbeat to report. Clamped
+	// to int32 max to keep the field shape stable on rare hour-long
+	// stalls; values that high already mean "agent is broken" so the
+	// exact number doesn't matter past saturation.
+	rtt := time.Since(hbStart).Milliseconds()
+	if rtt < 0 {
+		rtt = 0
+	}
+	if rtt > 2_147_483_647 {
+		rtt = 2_147_483_647
+	}
+	a.lastHeartbeatRttMs.Store(int32(rtt))
 
 	updates := res.GetConfigUpdates()
 

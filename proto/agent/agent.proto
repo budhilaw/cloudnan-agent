@@ -300,6 +300,15 @@ message HeartbeatRequest {
   string agent_id = 1;
   int64 timestamp = 2;
   AgentStatus status = 3;
+  // last_rtt_ms is the round-trip latency the agent measured on its
+  // PREVIOUS Heartbeat RPC (start = right before client.Heartbeat,
+  // end = right after the response returned). Reported on the
+  // following heartbeat so the BE can persist the agent ↔ control-
+  // plane latency and surface it on the Managed VM detail page.
+  // Self-measured on the agent's clock so it's accurate regardless
+  // of NTP drift between BE and agent. 0 = first heartbeat of the
+  // session (no prior measurement) or measurement failed.
+  int32 last_rtt_ms = 4;
 }
 
 message HeartbeatResponse {
