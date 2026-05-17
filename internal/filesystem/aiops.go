@@ -354,15 +354,32 @@ func (m *Manager) resolveForAI(input string, allowMissing bool) (string, error) 
 	if err := checkBlocked(cleaned); err != nil {
 		return "", err
 	}
-	// Resolve symlinks IFF the target exists. EvalSymlinks fails on
-	// non-existent paths so we tolerate that for creates.
+	// Resolve symlinks IFF the target exists. EvalSymlinks returns
+	// ErrNotExist for two distinct situations we have to tell apart:
+	//   1. the path itself has no entry on disk (a fresh-create case —
+	//      respect allowMissing).
+	//   2. the path IS a symlink, and the entry exists, but the link's
+	//      target is missing (a broken symlink — e.g. an orphaned
+	//      /etc/nginx/sites-enabled/foo whose sites-available file was
+	//      already removed). We still want to operate on the link
+	//      itself (delete, restore, readlink-for-backup), so treat the
+	//      link's cleaned path as the resolved path. There is no
+	//      chained target left to smuggle through the blocklist, so the
+	//      re-check below stays safe.
 	resolved := cleaned
 	if r, err := filepath.EvalSymlinks(cleaned); err == nil {
 		resolved = r
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if errors.Is(err, os.ErrNotExist) {
+		if _, lerr := os.Lstat(cleaned); lerr == nil {
+			// Broken symlink: the entry is present, only its target is
+			// gone. Leave resolved == cleaned so callers (AIDelete,
+			// AIBackup, AIRestore) can operate on the link itself
+			// instead of failing the whole op on the missing target.
+		} else if !allowMissing {
+			return "", err
+		}
+	} else {
 		return "", fmt.Errorf("resolve symlinks: %w", err)
-	} else if !allowMissing {
-		return "", err
 	}
 	// Re-check the resolved path so a symlink under a writable dir
 	// can't smuggle in a blocked target.
