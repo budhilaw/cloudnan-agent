@@ -12,7 +12,12 @@ concurrency:
 jobs:
   build-and-release:
     name: Build & Release Agent
-    runs-on: ubuntu-latest
+    # Self-hosted runner on cloudnan-api VPS — see
+    # cloudnan-core/scripts/install-github-runner.sh for setup.
+    # The agent release also installs protobuf-compiler via apt;
+    # that's no-op on the self-hosted runner because we pre-install
+    # it system-wide.
+    runs-on: self-hosted
     permissions:
       contents: write  # required to create releases and push tags
 
@@ -35,9 +40,13 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Building version: ${VERSION}"
 
-      - name: Install protoc and plugins
+      - name: Install protoc plugins (protoc itself is pre-installed on the self-hosted runner)
         run: |
-          sudo apt-get install -y protobuf-compiler
+          # The self-hosted runner doesn't have passwordless sudo; the
+          # install script (cloudnan-core/scripts/install-github-runner.sh)
+          # pre-installed protobuf-compiler system-wide. We still re-install
+          # the Go plugins here so a fresh release pulls the current
+          # versions instead of whatever was on the runner from setup time.
           go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
