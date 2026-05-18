@@ -12,12 +12,15 @@ concurrency:
 jobs:
   build-and-release:
     name: Build & Release Agent
-    # Self-hosted runner on cloudnan-api VPS — see
-    # cloudnan-core/scripts/install-github-runner.sh for setup.
-    # The agent release also installs protobuf-compiler via apt;
-    # that's no-op on the self-hosted runner because we pre-install
-    # it system-wide.
-    runs-on: self-hosted
+    # GitHub-hosted runner on purpose: this repo is public, and
+    # self-hosted runners on public repos are a security risk if any
+    # workflow ever gains a `pull_request` trigger (a fork's malicious
+    # PR could execute code on the runner host). The agent release is
+    # small (~2 min, ~10 runs/mo) and stays comfortably inside the
+    # free GHA quota even with the other two private repos moved to
+    # self-hosted runners. See cloudnan-core/scripts/install-github-
+    # runner.sh for the self-hosted setup used by core + frontend.
+    runs-on: ubuntu-latest
     permissions:
       contents: write  # required to create releases and push tags
 
@@ -40,13 +43,9 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Building version: ${VERSION}"
 
-      - name: Install protoc plugins (protoc itself is pre-installed on the self-hosted runner)
+      - name: Install protoc and plugins
         run: |
-          # The self-hosted runner doesn't have passwordless sudo; the
-          # install script (cloudnan-core/scripts/install-github-runner.sh)
-          # pre-installed protobuf-compiler system-wide. We still re-install
-          # the Go plugins here so a fresh release pulls the current
-          # versions instead of whatever was on the runner from setup time.
+          sudo apt-get install -y protobuf-compiler
           go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
