@@ -67,6 +67,15 @@ type Agent struct {
 	// so the heartbeat goroutine can update it without locking the
 	// main agent mutex (the tick is on the hot path).
 	lastHeartbeatRttMs atomic.Int32
+
+	// latestMetrics holds the most recent collected snapshot. A background
+	// collector goroutine writes it; the metrics send loop reads it. This
+	// decouples (slow) collection from (fixed-cadence) sending: even if a
+	// single collection stalls, the send loop keeps shipping the last good
+	// snapshot every interval, so the control plane's freshness window never
+	// lapses and the agent never falsely shows "Agent Not Responding" while
+	// its heartbeat is still healthy.
+	latestMetrics atomic.Pointer[pb.MetricsData]
 }
 
 // New creates a new Agent
@@ -133,6 +142,14 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	backoff := 5 * time.Second
 	const maxBackoff = 30 * time.Second
+
+	// Launch the metrics collector once for the agent's whole lifetime, tied to
+	// the root context (NOT a per-connection context). It keeps a.latestMetrics
+	// fresh across reconnects; the per-connection send loop just ships the
+	// latest snapshot. Decoupling collection from sending is what prevents a
+	// slow probe on a busy box from stalling metric delivery (the cause of the
+	// false "Agent Not Responding" while heartbeats stayed healthy).
+	go a.runMetricsCollector(ctx)
 
 	for {
 		if ctx.Err() != nil {
@@ -517,7 +534,12 @@ func (a *Agent) reRegister(ctx context.Context, client pb.AgentServiceClient, to
 	}
 }
 
-// runMetricsStream handles metrics streaming with retry logic
+// runMetricsStream maintains the StreamMetrics RPC and ships whatever snapshot
+// the collector last produced, at a fixed cadence. Collection happens in
+// runMetricsCollector (launched once from Run); this loop never collects, so a
+// slow probe can't delay metric delivery past the control plane's freshness
+// window — the bug where an agent stayed online by heartbeat but showed
+// "Agent Not Responding" in Monitoring.
 func (a *Agent) runMetricsStream(ctx context.Context, client pb.AgentServiceClient, token string) {
 	backoff := 5 * time.Second
 	maxBackoff := 30 * time.Second
@@ -553,6 +575,18 @@ func (a *Agent) runMetricsStream(ctx context.Context, client pb.AgentServiceClie
 		backoff = 5 * time.Second
 		log.Println("Metrics stream connected")
 
+		// Drain server acks so HTTP/2 flow control never backs up and stalls
+		// our Send side. Closes streamBroken when the stream fails.
+		streamBroken := make(chan struct{})
+		go func() {
+			for {
+				if _, err := stream.Recv(); err != nil {
+					close(streamBroken)
+					return
+				}
+			}
+		}()
+
 		ticker := time.NewTicker(5 * time.Second)
 		streamActive := true
 
@@ -561,172 +595,21 @@ func (a *Agent) runMetricsStream(ctx context.Context, client pb.AgentServiceClie
 			case <-ctx.Done():
 				ticker.Stop()
 				return
+			case <-streamBroken:
+				streamActive = false
 			case <-ticker.C:
-				// Get system info using monitor
-				metrics, err := a.monitor.Collect()
-				if err != nil {
-					log.Printf("Failed to collect metrics: %v", err)
+				pbMetrics := a.latestMetrics.Load()
+				if pbMetrics == nil {
+					// Collector hasn't produced a first snapshot yet.
 					continue
 				}
-
-				// Convert disk metrics with filtering AND fstype
-				var diskMetrics []*pb.DiskMetrics
-				for _, d := range metrics.Disks {
-					// Filter out insignificant mounts (heuristic)
-					// Skip if total size is very small (< 10MB) - likely not a real disk
-					if d.Total < 10*1024*1024 {
-						continue
-					}
-
-					diskMetrics = append(diskMetrics, &pb.DiskMetrics{
-						MountPoint:    d.MountPoint,
-						Device:        d.Device,
-						Total:         d.Total,
-						Used:          d.Used,
-						Free:          d.Free,
-						Percent:       d.Percent,
-						Fstype:        d.Fstype,
-						InodesTotal:   d.InodesTotal,
-						InodesUsed:    d.InodesUsed,
-						InodesPercent: d.InodesPercent,
-					})
-				}
-
-				// Convert Disk I/O
-				var diskIO []*pb.DiskIO
-				for _, io := range metrics.DiskIO {
-					diskIO = append(diskIO, &pb.DiskIO{
-						Name:       io.Name,
-						ReadCount:  io.ReadCount,
-						WriteCount: io.WriteCount,
-						ReadBytes:  io.ReadBytes,
-						WriteBytes: io.WriteBytes,
-					})
-				}
-
-				// Host Info
-				var hostInfo *pb.HostInfo
-				if metrics.HostInfo != nil {
-					hostInfo = &pb.HostInfo{
-						Hostname:             metrics.HostInfo.Platform, // Misnomer in gopsutil?
-						Os:                   metrics.HostInfo.Platform, // Use Platform as OS name
-						Platform:             metrics.HostInfo.Platform,
-						PlatformFamily:       metrics.HostInfo.PlatformFamily,
-						PlatformVersion:      metrics.HostInfo.PlatformVersion,
-						KernelVersion:        metrics.HostInfo.KernelVersion,
-						KernelArch:           metrics.HostInfo.KernelArch,
-						VirtualizationSystem: metrics.HostInfo.VirtualizationSystem,
-						VirtualizationRole:   metrics.HostInfo.VirtualizationRole,
-						BootTime:             metrics.HostInfo.BootTime,
-					}
-				}
-
-				// Get Services
-				var pbServices []*pb.ServiceInfo
-				services := a.monitor.GetServices()
-				for _, s := range services {
-					pbServices = append(pbServices, &pb.ServiceInfo{
-						Name:        s.Name,
-						Status:      s.Status,
-						Restarts:    s.Restarts,
-						LastRestart: s.LastRestart,
-					})
-				}
-
-				// Get Containers
-				var pbContainers []*pb.ContainerInfo
-				containers := a.monitor.GetContainers()
-				for _, c := range containers {
-					pbContainers = append(pbContainers, &pb.ContainerInfo{
-						Id:        c.ID,
-						Name:      c.Name,
-						Image:     c.Image,
-						Status:    c.Status,
-						Health:    c.Health,
-						Restarts:  c.Restarts,
-						StartedAt: c.StartedAt,
-					})
-				}
-
-				// Get Firewall
-				fwInfo := a.monitor.GetFirewall()
-				var pbRules []*pb.FirewallRule
-				for _, r := range fwInfo.Rules {
-					pbRules = append(pbRules, &pb.FirewallRule{
-						Index:    r.Index,
-						To:       r.To,
-						Action:   r.Action,
-						From:     r.From,
-						Protocol: r.Protocol,
-						Comment:  r.Comment,
-					})
-				}
-				pbFirewall := &pb.FirewallInfo{
-					Status: fwInfo.Status,
-					Rules:  pbRules,
-				}
-
-				// Get Processes
-				var pbProcesses []*pb.ProcessInfo
-				for _, p := range metrics.Processes {
-					pbProcesses = append(pbProcesses, &pb.ProcessInfo{
-						Pid:            p.PID,
-						Name:           p.Name,
-						Username:       p.Username,
-						CpuPercent:     p.CPUPercent,
-						MemPercent:     p.MemPercent,
-						Rss:            p.RSS,
-						CreateTime:     p.CreateTime,
-						DiskReadBytes:  p.DiskReadBytes,
-						DiskWriteBytes: p.DiskWriteBytes,
-						NetConnections: p.NetConnections,
-					})
-				}
-
-				pbMetrics := &pb.MetricsData{
-					AgentId:          a.agentID,
-					Timestamp:        time.Now().Unix(),
-					CpuPercent:       metrics.CPUPercent,
-					CpuPerCore:       metrics.CPUPerCore,
-					MemoryTotal:      metrics.MemoryTotal,
-					MemoryUsed:       metrics.MemoryUsed,
-					MemoryAvailable:  metrics.MemoryAvailable,
-					MemoryPercent:    metrics.MemoryPercent,
-					MemoryCached:     metrics.MemoryCached,
-					MemoryBuffers:    metrics.MemoryBuffers,
-					SwapTotal:        metrics.SwapTotal,
-					SwapUsed:         metrics.SwapUsed,
-					SwapFree:         metrics.SwapFree,
-					SwapPercent:      metrics.SwapPercent,
-					Disks:            diskMetrics,
-					DiskIo:           diskIO,
-					NetworkBytesSent: metrics.NetworkBytesSent,
-					NetworkBytesRecv: metrics.NetworkBytesRecv,
-					Connections:      metrics.Connections,
-					NetErrin:         metrics.NetworkErrin,
-					NetErrout:        metrics.NetworkErrout,
-					NetDropin:        metrics.NetworkDropin,
-					NetDropout:       metrics.NetworkDropout,
-					CpuStealTime:     metrics.CPUStealTime,
-					CpuIowait:        metrics.CPUIowait,
-					Load_1:           metrics.Load1,
-					Load_5:           metrics.Load5,
-					Load_15:          metrics.Load15,
-					UptimeSeconds:    metrics.UptimeSeconds,
-					HostInfo:         hostInfo,
-					Services:         pbServices,
-					Containers:       pbContainers,
-					Firewall:         pbFirewall,
-					Processes:        pbProcesses,
-				}
-
 				if err := stream.Send(pbMetrics); err != nil {
 					log.Printf("Failed to send metrics: %v, reconnecting in %v...", err, backoff)
-					ticker.Stop()
 					streamActive = false
 				}
 			}
 		}
+		ticker.Stop()
 
 		// Wait before reconnecting
 		select {
@@ -736,6 +619,193 @@ func (a *Agent) runMetricsStream(ctx context.Context, client pb.AgentServiceClie
 			backoff = min(backoff*2, maxBackoff)
 		}
 	}
+}
+
+// runMetricsCollector continuously rebuilds the metrics snapshot and publishes
+// the latest to a.latestMetrics. Launched once for the agent's lifetime so it
+// survives stream reconnects.
+func (a *Agent) runMetricsCollector(ctx context.Context) {
+	// Prime immediately so the first send isn't delayed a whole interval.
+	if snap := a.collectSnapshot(); snap != nil {
+		a.latestMetrics.Store(snap)
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if snap := a.collectSnapshot(); snap != nil {
+				a.latestMetrics.Store(snap)
+			}
+		}
+	}
+}
+
+// collectSnapshot builds a full metrics payload. Returns nil only when the base
+// system collection fails outright (the slow per-collection getters are already
+// individually timeout-bounded and cached inside the monitor).
+func (a *Agent) collectSnapshot() *pb.MetricsData {
+	// Get system info using monitor
+	metrics, err := a.monitor.Collect()
+	if err != nil {
+		log.Printf("Failed to collect metrics: %v", err)
+		return nil
+	}
+
+	// Convert disk metrics with filtering AND fstype
+	var diskMetrics []*pb.DiskMetrics
+	for _, d := range metrics.Disks {
+		// Filter out insignificant mounts (heuristic)
+		// Skip if total size is very small (< 10MB) - likely not a real disk
+		if d.Total < 10*1024*1024 {
+			continue
+		}
+
+		diskMetrics = append(diskMetrics, &pb.DiskMetrics{
+			MountPoint:    d.MountPoint,
+			Device:        d.Device,
+			Total:         d.Total,
+			Used:          d.Used,
+			Free:          d.Free,
+			Percent:       d.Percent,
+			Fstype:        d.Fstype,
+			InodesTotal:   d.InodesTotal,
+			InodesUsed:    d.InodesUsed,
+			InodesPercent: d.InodesPercent,
+		})
+	}
+
+	// Convert Disk I/O
+	var diskIO []*pb.DiskIO
+	for _, io := range metrics.DiskIO {
+		diskIO = append(diskIO, &pb.DiskIO{
+			Name:       io.Name,
+			ReadCount:  io.ReadCount,
+			WriteCount: io.WriteCount,
+			ReadBytes:  io.ReadBytes,
+			WriteBytes: io.WriteBytes,
+		})
+	}
+
+	// Host Info
+	var hostInfo *pb.HostInfo
+	if metrics.HostInfo != nil {
+		hostInfo = &pb.HostInfo{
+			Hostname:             metrics.HostInfo.Platform, // Misnomer in gopsutil?
+			Os:                   metrics.HostInfo.Platform, // Use Platform as OS name
+			Platform:             metrics.HostInfo.Platform,
+			PlatformFamily:       metrics.HostInfo.PlatformFamily,
+			PlatformVersion:      metrics.HostInfo.PlatformVersion,
+			KernelVersion:        metrics.HostInfo.KernelVersion,
+			KernelArch:           metrics.HostInfo.KernelArch,
+			VirtualizationSystem: metrics.HostInfo.VirtualizationSystem,
+			VirtualizationRole:   metrics.HostInfo.VirtualizationRole,
+			BootTime:             metrics.HostInfo.BootTime,
+		}
+	}
+
+	// Get Services
+	var pbServices []*pb.ServiceInfo
+	services := a.monitor.GetServices()
+	for _, s := range services {
+		pbServices = append(pbServices, &pb.ServiceInfo{
+			Name:        s.Name,
+			Status:      s.Status,
+			Restarts:    s.Restarts,
+			LastRestart: s.LastRestart,
+		})
+	}
+
+	// Get Containers
+	var pbContainers []*pb.ContainerInfo
+	containers := a.monitor.GetContainers()
+	for _, c := range containers {
+		pbContainers = append(pbContainers, &pb.ContainerInfo{
+			Id:        c.ID,
+			Name:      c.Name,
+			Image:     c.Image,
+			Status:    c.Status,
+			Health:    c.Health,
+			Restarts:  c.Restarts,
+			StartedAt: c.StartedAt,
+		})
+	}
+
+	// Get Firewall
+	fwInfo := a.monitor.GetFirewall()
+	var pbRules []*pb.FirewallRule
+	for _, r := range fwInfo.Rules {
+		pbRules = append(pbRules, &pb.FirewallRule{
+			Index:    r.Index,
+			To:       r.To,
+			Action:   r.Action,
+			From:     r.From,
+			Protocol: r.Protocol,
+			Comment:  r.Comment,
+		})
+	}
+	pbFirewall := &pb.FirewallInfo{
+		Status: fwInfo.Status,
+		Rules:  pbRules,
+	}
+
+	// Get Processes
+	var pbProcesses []*pb.ProcessInfo
+	for _, p := range metrics.Processes {
+		pbProcesses = append(pbProcesses, &pb.ProcessInfo{
+			Pid:            p.PID,
+			Name:           p.Name,
+			Username:       p.Username,
+			CpuPercent:     p.CPUPercent,
+			MemPercent:     p.MemPercent,
+			Rss:            p.RSS,
+			CreateTime:     p.CreateTime,
+			DiskReadBytes:  p.DiskReadBytes,
+			DiskWriteBytes: p.DiskWriteBytes,
+			NetConnections: p.NetConnections,
+		})
+	}
+
+	pbMetrics := &pb.MetricsData{
+		AgentId:          a.agentID,
+		Timestamp:        time.Now().Unix(),
+		CpuPercent:       metrics.CPUPercent,
+		CpuPerCore:       metrics.CPUPerCore,
+		MemoryTotal:      metrics.MemoryTotal,
+		MemoryUsed:       metrics.MemoryUsed,
+		MemoryAvailable:  metrics.MemoryAvailable,
+		MemoryPercent:    metrics.MemoryPercent,
+		MemoryCached:     metrics.MemoryCached,
+		MemoryBuffers:    metrics.MemoryBuffers,
+		SwapTotal:        metrics.SwapTotal,
+		SwapUsed:         metrics.SwapUsed,
+		SwapFree:         metrics.SwapFree,
+		SwapPercent:      metrics.SwapPercent,
+		Disks:            diskMetrics,
+		DiskIo:           diskIO,
+		NetworkBytesSent: metrics.NetworkBytesSent,
+		NetworkBytesRecv: metrics.NetworkBytesRecv,
+		Connections:      metrics.Connections,
+		NetErrin:         metrics.NetworkErrin,
+		NetErrout:        metrics.NetworkErrout,
+		NetDropin:        metrics.NetworkDropin,
+		NetDropout:       metrics.NetworkDropout,
+		CpuStealTime:     metrics.CPUStealTime,
+		CpuIowait:        metrics.CPUIowait,
+		Load_1:           metrics.Load1,
+		Load_5:           metrics.Load5,
+		Load_15:          metrics.Load15,
+		UptimeSeconds:    metrics.UptimeSeconds,
+		HostInfo:         hostInfo,
+		Services:         pbServices,
+		Containers:       pbContainers,
+		Firewall:         pbFirewall,
+		Processes:        pbProcesses,
+	}
+
+	return pbMetrics
 }
 
 // executeCommand runs a command and sends the response
@@ -1354,8 +1424,8 @@ func (a *Agent) checkModules(moduleIDs []string) *executor.Result {
 		"golang":        {"/usr/local/go/bin/go", "/usr/local/bin/go", "/usr/bin/go", "/snap/bin/go"},
 		"rust":          {"/usr/local/bin/rustc", "/root/.cargo/bin/rustc", "/usr/bin/rustc"},
 		// Hybrid modules (native or docker)
-		"jellyfin":      {"/usr/bin/jellyfin", "/usr/lib/jellyfin/bin/jellyfin"},
-		"qbittorrent":   {"/usr/bin/qbittorrent-nox"},
+		"jellyfin":    {"/usr/bin/jellyfin", "/usr/lib/jellyfin/bin/jellyfin"},
+		"qbittorrent": {"/usr/bin/qbittorrent-nox"},
 	}
 
 	status := make(map[string]bool)

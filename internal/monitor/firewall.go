@@ -1,9 +1,11 @@
 package monitor
 
 import (
+	"context"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type FirewallRule struct {
@@ -20,8 +22,38 @@ type FirewallInfo struct {
 	Rules  []FirewallRule
 }
 
-// GetFirewall returns status of ufw
+// GetFirewall returns status of ufw. Cached for shellCacheTTL and hard-bounded
+// by shellCmdTimeout. Running `ufw status` (via sudo) on the 5s metrics tick
+// flooded the auth log and risked stalling collection; this serves a cached
+// snapshot and only re-shells at most every shellCacheTTL.
 func (m *Monitor) GetFirewall() *FirewallInfo {
+	m.shellMu.Lock()
+	if m.firewallCache != nil && time.Since(m.firewallAt) < shellCacheTTL {
+		cached := m.firewallCache
+		m.shellMu.Unlock()
+		return cached
+	}
+	m.shellMu.Unlock()
+
+	fresh, ok := m.collectFirewall()
+
+	m.shellMu.Lock()
+	defer m.shellMu.Unlock()
+	if ok {
+		m.firewallCache = fresh
+		m.firewallAt = time.Now()
+		return fresh
+	}
+	if m.firewallCache != nil {
+		return m.firewallCache
+	}
+	return fresh
+}
+
+// collectFirewall does the actual ufw shell-out. The bool is false only when
+// the command times out (so the caller keeps the previous cache); installed/
+// not-installed/permission-denied are all legitimate (true) outcomes.
+func (m *Monitor) collectFirewall() (*FirewallInfo, bool) {
 	info := &FirewallInfo{
 		Status: "inactive",
 		Rules:  []FirewallRule{},
@@ -34,33 +66,41 @@ func (m *Monitor) GetFirewall() *FirewallInfo {
 		commonPaths := []string{"/usr/sbin/ufw", "/sbin/ufw"}
 		found := false
 		for _, p := range commonPaths {
-			// Just try to run it with version check to see if it exists/runs
-			if err := exec.Command(p, "--version").Run(); err == nil {
+			vctx, vcancel := context.WithTimeout(context.Background(), shellCmdTimeout)
+			runErr := exec.CommandContext(vctx, p, "--version").Run()
+			vcancel()
+			if runErr == nil {
 				found = true
 				break
 			}
 		}
 		if !found {
 			info.Status = "not_installed"
-			return info
+			return info, true
 		}
 	}
 
 	// Run ufw status numbered
 	// We need sudo for ufw usually, but agent runs as root hopefully?
 	// If not root, this might fail with "ERROR: You need to be root..."
-	cmd := exec.Command("ufw", "status", "numbered")
+	ctx, cancel := context.WithTimeout(context.Background(), shellCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ufw", "status", "numbered")
 	output, err := cmd.CombinedOutput()
 	outStr := string(output)
 
 	if err != nil {
+		// A timeout means we couldn't determine state — keep the last cache.
+		if ctx.Err() == context.DeadlineExceeded {
+			return info, false
+		}
 		// If permission denied or other error
 		if strings.Contains(outStr, "You need to be root") {
 			info.Status = "permission_denied"
 		} else {
 			info.Status = "error"
 		}
-		return info
+		return info, true
 	}
 
 	if strings.Contains(outStr, "Status: active") {
@@ -93,5 +133,5 @@ func (m *Monitor) GetFirewall() *FirewallInfo {
 		}
 	}
 
-	return info
+	return info, true
 }

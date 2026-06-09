@@ -117,7 +117,33 @@ type DiskMetrics struct {
 type Monitor struct {
 	mu         sync.Mutex
 	prevDiskIO map[int32]ioSnapshot // keyed by PID; tracks cumulative disk I/O for delta
+
+	// Cache for the slow, shell-out-backed collections (systemctl / docker /
+	// ufw). These must NOT run on the metrics hot path every interval: an
+	// unbounded or slow child process stalls metric delivery (the root cause
+	// of the "Agent Not Responding" class of bug — heartbeat keeps working
+	// while metrics go stale) and floods the sudo auth log. Each is recomputed
+	// at most once per shellCacheTTL, with a hard per-call timeout, and the
+	// last good value is served if a refresh times out.
+	shellMu         sync.Mutex
+	servicesCache   []ServiceInfo
+	servicesAt      time.Time
+	containersCache []ContainerInfo
+	containersAt    time.Time
+	firewallCache   *FirewallInfo
+	firewallAt      time.Time
 }
+
+const (
+	// shellCacheTTL is how long a services/containers/firewall snapshot is
+	// reused before the next refresh. Slow-changing data — 15s is plenty and
+	// keeps the metrics interval (5s) free of synchronous shell-outs.
+	shellCacheTTL = 15 * time.Second
+	// shellCmdTimeout hard-bounds each systemctl/docker/ufw child so a wedged
+	// daemon (slow docker socket, apt-lock contention, D-state) can never block
+	// metric collection indefinitely.
+	shellCmdTimeout = 5 * time.Second
+)
 
 type ioSnapshot struct {
 	ReadBytes  uint64
@@ -249,8 +275,15 @@ func (m *Monitor) Collect() (*Metrics, error) {
 		}
 	}
 
-	// Network Connections
-	conns, err := net.Connections("all")
+	// Network Connections — count only.
+	//
+	// net.Connections("all") resolves every socket's owning UID/PID by walking
+	// /proc/*/fd, which on a busy box (e.g. a Postgres host with hundreds of
+	// connections) takes seconds to minutes and was a primary cause of stalled
+	// metric delivery. We only need the count, so use the UID-less variant,
+	// which just reads /proc/net/{tcp,tcp6,udp,...} and skips the expensive
+	// inode→PID mapping.
+	conns, err := net.ConnectionsWithoutUids("all")
 	if err == nil {
 		metrics.Connections = uint64(len(conns))
 	}
@@ -459,22 +492,53 @@ type ProcessInfo struct {
 	NetConnections uint32 // active TCP/UDP connections
 }
 
-// GetServices returns status of systemd services
+// GetServices returns status of systemd services. Cached for shellCacheTTL and
+// hard-bounded by shellCmdTimeout so it never blocks the metrics hot path; on a
+// transient timeout the last good snapshot is served instead of an empty list.
 func (m *Monitor) GetServices() []ServiceInfo {
+	m.shellMu.Lock()
+	if m.servicesCache != nil && time.Since(m.servicesAt) < shellCacheTTL {
+		cached := m.servicesCache
+		m.shellMu.Unlock()
+		return cached
+	}
+	m.shellMu.Unlock()
+
+	fresh, ok := m.collectServices()
+
+	m.shellMu.Lock()
+	defer m.shellMu.Unlock()
+	if ok {
+		m.servicesCache = fresh
+		m.servicesAt = time.Now()
+		return fresh
+	}
+	if m.servicesCache != nil {
+		return m.servicesCache
+	}
+	return []ServiceInfo{}
+}
+
+// collectServices does the actual systemctl shell-out. The bool is false only
+// on a command error/timeout (so the caller keeps the previous cache); a host
+// with no systemd legitimately returns (empty, true).
+func (m *Monitor) collectServices() ([]ServiceInfo, bool) {
 	services := []ServiceInfo{}
 
 	// Check if systemd is available
 	_, err := exec.LookPath("systemctl")
 	if err != nil {
-		return services
+		return services, true
 	}
 
 	// List active and failed services
 	// systemctl list-units --type=service --state=active,failed --no-pager --no-legend --plain
-	cmd := exec.Command("systemctl", "list-units", "--type=service", "--state=active,failed", "--no-pager", "--no-legend", "--plain")
+	ctx, cancel := context.WithTimeout(context.Background(), shellCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "list-units", "--type=service", "--state=active,failed", "--no-pager", "--no-legend", "--plain")
 	output, err := cmd.Output()
 	if err != nil {
-		return services
+		return nil, false
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
@@ -519,20 +583,58 @@ func (m *Monitor) GetServices() []ServiceInfo {
 		})
 	}
 
-	return services
+	return services, true
 }
 
-// GetContainers returns status of Docker containers
+// GetContainers returns status of Docker containers. Cached for shellCacheTTL
+// and hard-bounded by shellCmdTimeout: a wedged docker daemon (slow/hung
+// socket) can no longer stall metric collection.
 func (m *Monitor) GetContainers() []ContainerInfo {
+	m.shellMu.Lock()
+	if m.containersCache != nil && time.Since(m.containersAt) < shellCacheTTL {
+		cached := m.containersCache
+		m.shellMu.Unlock()
+		return cached
+	}
+	m.shellMu.Unlock()
+
+	fresh, ok := m.collectContainers()
+
+	m.shellMu.Lock()
+	defer m.shellMu.Unlock()
+	if ok {
+		m.containersCache = fresh
+		m.containersAt = time.Now()
+		return fresh
+	}
+	if m.containersCache != nil {
+		return m.containersCache
+	}
+	return []ContainerInfo{}
+}
+
+// collectContainers does the actual docker shell-out. The bool is false only on
+// a command error/timeout. A host with no docker installed also returns
+// (empty, false) — but since there's no cache to fall back to, GetContainers
+// still yields an empty list, which is correct.
+func (m *Monitor) collectContainers() ([]ContainerInfo, bool) {
 	containers := []ContainerInfo{}
+
+	// Skip entirely if docker isn't installed — avoids spawning a doomed child
+	// (and a misleading error) every refresh on the many hosts without docker.
+	if _, err := exec.LookPath("docker"); err != nil {
+		return containers, true
+	}
 
 	// Use docker ps to get container info
 	// format: ID|Names|Image|Status|State
-	cmd := exec.Command("docker", "ps", "-a", "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}")
+	ctx, cancel := context.WithTimeout(context.Background(), shellCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "ps", "-a", "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}")
 	output, err := cmd.Output()
 	if err != nil {
-		// Docker might not be installed or running
-		return containers
+		// Docker daemon unreachable / timed out
+		return nil, false
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
@@ -569,5 +671,5 @@ func (m *Monitor) GetContainers() []ContainerInfo {
 			Status: status,
 		})
 	}
-	return containers
+	return containers, true
 }
