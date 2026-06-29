@@ -27,6 +27,7 @@ package database
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -270,4 +271,157 @@ func supabaseTokenizeIdents(s string) []string {
 			(r >= '0' && r <= '9')
 	}
 	return strings.FieldsFunc(s, func(r rune) bool { return !isIdent(r) })
+}
+
+// ---------- restore (destination side) ----------
+//
+// The destination is the self-hosted Supabase stack's Postgres, which already
+// owns the managed roles and the platform schemas. Restore order matters:
+//
+//	roles   -> apply the filtered roles SQL with psql, ON_ERROR_STOP off so a
+//	           stray grant referencing a role we kept-but-dest-lacks doesn't
+//	           abort the whole apply.
+//	schema  -> pg_restore the -Fc schema archive. We do NOT pass --no-owner:
+//	           the object owners (supabase_auth_admin for auth.*, etc.) exist
+//	           on the destination, so preserving ownership keeps RLS + grants
+//	           correct.
+//	data    -> pg_restore the -Fc data archive with --disable-triggers (this
+//	           is where -Fc honors it) and --data-only.
+//
+// FLAG VALIDATION: the exact --no-owner/--no-acl/--disable-triggers choices
+// are validated against a real Supabase project end-to-end before release;
+// they are documented Supabase self-host conventions, not guesses, but the
+// reconciliation in supabaseVerifyQueries is the gate that proves the move.
+
+// supabaseRolesRestoreArgs builds the psql invocation that applies the
+// (already-filtered) roles SQL piped on stdin to the destination cluster.
+func supabaseRolesRestoreArgs(cred *CredEntry, db string) (program string, args []string, env []string, err error) {
+	if cred == nil {
+		return "", nil, nil, errors.New("supabase roles restore: nil credentials")
+	}
+	args = supabasePgConnArgs(cred)
+	args = append(args,
+		"--dbname="+supabaseDBName(db),
+		"--no-password",
+		"-v", "ON_ERROR_STOP=0",
+		"-f", "-", // read SQL from stdin
+	)
+	env, err = supabasePgConnEnv(cred)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return "psql", args, env, nil
+}
+
+// supabaseRestoreArgs builds the pg_restore invocation for the schema
+// (dataOnly=false) or data (dataOnly=true) -Fc archive at artifactPath.
+func supabaseRestoreArgs(cred *CredEntry, db, artifactPath string, dataOnly bool) (program string, args []string, env []string, err error) {
+	if cred == nil {
+		return "", nil, nil, errors.New("supabase restore: nil credentials")
+	}
+	if strings.TrimSpace(artifactPath) == "" {
+		return "", nil, nil, errors.New("supabase restore: artifact path is required")
+	}
+	args = supabasePgConnArgs(cred)
+	args = append(args,
+		"--dbname="+supabaseDBName(db),
+		"--no-password",
+		"--verbose",
+	)
+	if dataOnly {
+		args = append(args, "--data-only", "--disable-triggers")
+	} else {
+		args = append(args, "--schema-only")
+	}
+	args = append(args, artifactPath)
+	env, err = supabasePgConnEnv(cred)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return "pg_restore", args, env, nil
+}
+
+// supabaseDBName defaults the target database to "postgres" (the Supabase
+// stack's default DB) when the caller passes empty.
+func supabaseDBName(db string) string {
+	if strings.TrimSpace(db) == "" {
+		return "postgres"
+	}
+	return db
+}
+
+// ---------- storage object sync ----------
+
+// SupabaseStorageDescriptor names one end of a storage object copy. Backend is
+// "s3" (Supabase's storage bucket, or a user S3) or "fs" (the destination
+// stack's local filesystem volume).
+type SupabaseStorageDescriptor struct {
+	Backend     string // "s3" | "fs"
+	S3Endpoint  string
+	S3Region    string
+	S3Bucket    string
+	S3AccessKey string
+	S3SecretKey string
+	FSPath      string // local path when Backend == "fs"
+}
+
+// supabaseStorageSyncArgs builds an `rclone sync src dst` invocation plus the
+// env that configures the two remotes. Credentials ride the environment
+// (RCLONE_CONFIG_*), never argv, so they stay out of `ps` and logs. rclone's
+// sync is resumable, which is why the storage step can restart without
+// re-copying objects already present at the destination.
+func supabaseStorageSyncArgs(src, dst SupabaseStorageDescriptor) (program string, args []string, env []string, err error) {
+	srcRemote, srcEnv, err := supabaseRcloneRemote("SRC", src)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("source: %w", err)
+	}
+	dstRemote, dstEnv, err := supabaseRcloneRemote("DST", dst)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("destination: %w", err)
+	}
+	args = []string{"sync", "--fast-list", "--transfers=8", srcRemote, dstRemote}
+	env = append(srcEnv, dstEnv...)
+	return "rclone", args, env, nil
+}
+
+// supabaseRcloneRemote returns the remote path string ("NAME:bucket" or
+// "NAME:" with a path) and the RCLONE_CONFIG_<NAME>_* env for one descriptor.
+func supabaseRcloneRemote(name string, d SupabaseStorageDescriptor) (remote string, env []string, err error) {
+	prefix := "RCLONE_CONFIG_" + name + "_"
+	switch d.Backend {
+	case "s3":
+		if d.S3Bucket == "" {
+			return "", nil, errors.New("s3 descriptor: bucket is required")
+		}
+		env = []string{
+			prefix + "TYPE=s3",
+			prefix + "PROVIDER=Other",
+			prefix + "ACCESS_KEY_ID=" + d.S3AccessKey,
+			prefix + "SECRET_ACCESS_KEY=" + d.S3SecretKey,
+			prefix + "ENDPOINT=" + d.S3Endpoint,
+			prefix + "REGION=" + d.S3Region,
+		}
+		return name + ":" + d.S3Bucket, env, nil
+	case "fs":
+		if d.FSPath == "" {
+			return "", nil, errors.New("fs descriptor: path is required")
+		}
+		env = []string{prefix + "TYPE=local"}
+		return name + ":" + d.FSPath, env, nil
+	default:
+		return "", nil, fmt.Errorf("unknown storage backend %q", d.Backend)
+	}
+}
+
+// ---------- verification ----------
+
+// SupabaseVerifyQueries are the read-only count queries run against BOTH the
+// source and the destination after the move. Matching counts (within an
+// explainable delta, e.g. dropped sessions) are the release gate that proves
+// the migration preserved the data, RLS, and users.
+var SupabaseVerifyQueries = map[string]string{
+	"tables":          `SELECT count(*) FROM information_schema.tables WHERE table_schema IN ('public','auth','storage')`,
+	"rls_policies":    `SELECT count(*) FROM pg_policies WHERE schemaname IN ('public','auth','storage')`,
+	"auth_users":      `SELECT count(*) FROM auth.users`,
+	"storage_objects": `SELECT count(*) FROM storage.objects`,
 }

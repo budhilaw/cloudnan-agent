@@ -164,6 +164,117 @@ func TestSupabaseFilterRolesSQL(t *testing.T) {
 	}
 }
 
+func TestSupabaseRestoreArgs(t *testing.T) {
+	cred := &CredEntry{Host: "127.0.0.1", Port: 5432, Username: "postgres", Password: "pw"}
+
+	// Schema restore: no --data-only, no --disable-triggers, owners preserved.
+	prog, args, _, err := supabaseRestoreArgs(cred, "postgres", "/tmp/schema.dump", false)
+	if err != nil {
+		t.Fatalf("schema restore: %v", err)
+	}
+	if prog != "pg_restore" {
+		t.Errorf("program = %q; want pg_restore", prog)
+	}
+	j := strings.Join(args, " ")
+	if !strings.Contains(j, "--schema-only") || strings.Contains(j, "--data-only") {
+		t.Errorf("schema restore flags wrong: %v", args)
+	}
+	if strings.Contains(j, "--no-owner") {
+		t.Errorf("must preserve ownership (no --no-owner) so RLS/grants stay correct: %v", args)
+	}
+	if !strings.Contains(j, "/tmp/schema.dump") {
+		t.Errorf("artifact path missing: %v", args)
+	}
+
+	// Data restore: --data-only + --disable-triggers.
+	_, dargs, _, err := supabaseRestoreArgs(cred, "postgres", "/tmp/data.dump", true)
+	if err != nil {
+		t.Fatalf("data restore: %v", err)
+	}
+	dj := strings.Join(dargs, " ")
+	if !strings.Contains(dj, "--data-only") || !strings.Contains(dj, "--disable-triggers") {
+		t.Errorf("data restore must be --data-only --disable-triggers: %v", dargs)
+	}
+
+	if _, _, _, err := supabaseRestoreArgs(cred, "postgres", "", false); err == nil {
+		t.Error("empty artifact path should error")
+	}
+}
+
+func TestSupabaseRolesRestoreArgs(t *testing.T) {
+	cred := &CredEntry{Username: "postgres", Password: "pw"}
+	prog, args, env, err := supabaseRolesRestoreArgs(cred, "")
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if prog != "psql" {
+		t.Errorf("program = %q; want psql", prog)
+	}
+	j := strings.Join(args, " ")
+	if !strings.Contains(j, "ON_ERROR_STOP=0") {
+		t.Errorf("roles restore must tolerate errors: %v", args)
+	}
+	if !strings.Contains(j, "--dbname=postgres") {
+		t.Errorf("empty db should default to postgres: %v", args)
+	}
+	if !contains(env, "PGPASSWORD=pw") {
+		t.Errorf("password must ride env: %v", env)
+	}
+}
+
+func TestSupabaseStorageSyncArgs(t *testing.T) {
+	src := SupabaseStorageDescriptor{
+		Backend: "s3", S3Endpoint: "https://x.supabase.co/storage/v1/s3",
+		S3Region: "ap-southeast-1", S3Bucket: "objects",
+		S3AccessKey: "AK", S3SecretKey: "SK",
+	}
+	dst := SupabaseStorageDescriptor{Backend: "fs", FSPath: "/var/lib/storage"}
+
+	prog, args, env, err := supabaseStorageSyncArgs(src, dst)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if prog != "rclone" {
+		t.Errorf("program = %q; want rclone", prog)
+	}
+	j := strings.Join(args, " ")
+	if !strings.HasPrefix(j, "sync ") {
+		t.Errorf("must be an rclone sync: %v", args)
+	}
+	if !strings.Contains(j, "SRC:objects") || !strings.Contains(j, "DST:/var/lib/storage") {
+		t.Errorf("remotes wrong: %v", args)
+	}
+	// Secret key rides env, never argv.
+	if strings.Contains(j, "SK") {
+		t.Errorf("secret leaked into argv: %v", args)
+	}
+	if !contains(env, "RCLONE_CONFIG_SRC_SECRET_ACCESS_KEY=SK") {
+		t.Errorf("env must carry the s3 secret: %v", env)
+	}
+	if !contains(env, "RCLONE_CONFIG_DST_TYPE=local") {
+		t.Errorf("destination fs remote misconfigured: %v", env)
+	}
+
+	if _, _, _, err := supabaseStorageSyncArgs(SupabaseStorageDescriptor{Backend: "bogus"}, dst); err == nil {
+		t.Error("unknown backend should error")
+	}
+}
+
+func TestSupabaseVerifyQueries(t *testing.T) {
+	for _, k := range []string{"tables", "rls_policies", "auth_users", "storage_objects"} {
+		q, ok := SupabaseVerifyQueries[k]
+		if !ok || !strings.Contains(strings.ToLower(q), "count(") {
+			t.Errorf("verify query %q missing or not a count: %q", k, q)
+		}
+	}
+	if !strings.Contains(SupabaseVerifyQueries["auth_users"], "auth.users") {
+		t.Error("auth_users must count auth.users")
+	}
+	if !strings.Contains(SupabaseVerifyQueries["rls_policies"], "pg_policies") {
+		t.Error("rls_policies must read pg_policies")
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
