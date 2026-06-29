@@ -63,13 +63,21 @@ var hardBlockPatterns = []*regexp.Regexp{
 	// Disabling/removing the cloudnan agent itself.
 	regexp.MustCompile(`(?i)\bsystemctl\s+(?:disable|stop|mask)\s+cloudnan-agent\b`),
 	regexp.MustCompile(`(?i)\b(?:apt(?:-get)?|yum|dnf|zypper)\s+(?:remove|purge|erase)\s+(?:[^&;|]*\s+)?cloudnan-agent\b`),
-	// Curl-piping arbitrary internet shell scripts into root.
-	regexp.MustCompile(`(?i)\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|ksh)\b`),
 	// iptables -F flush (would drop all firewall rules) — UFW path is
 	// preferred and our tools wrap it; raw iptables -F is almost
 	// always a sign of a confused agent.
 	regexp.MustCompile(`(?i)\biptables\s+(-[A-Za-z]*\s+)*-F\b`),
 }
+
+// curlPipeShellPattern blocks piping a downloaded script straight into a
+// shell (`curl … | bash`). It is kept SEPARATE from hardBlockPatterns
+// because it is the one rule the trusted App Installer path relaxes:
+// catalog installers (docker, nodesource, redpanda, …) legitimately use
+// this idiom, whereas the hardBlockPatterns above (filesystem nukes,
+// mkfs/dd on disks, fork bombs, shutdown, disabling cloudnan-agent) must
+// hold even for first-party installs. Enforced for every user/LLM command
+// via isBlocked; skipped only by ExecuteInstall.
+var curlPipeShellPattern = regexp.MustCompile(`(?i)\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|ksh)\b`)
 
 // Executor handles command execution on the agent
 type Executor struct {
@@ -171,6 +179,47 @@ func (e *Executor) Execute(ctx context.Context, command string, args []string, e
 		}
 	}
 
+	return result, nil
+}
+
+// ExecuteInstall runs a first-party App Installer / clone shell command. It
+// is the trusted-install path: the curl|bash hard-block is relaxed (catalog
+// installers legitimately pipe vendor scripts into a shell), but isHardBlocked
+// STILL applies — so a bypass for installs can never become a bypass for
+// nuking the filesystem, reformatting a disk, fork-bombing, shutting the box
+// down, or disabling cloudnan-agent. Only the mTLS-gated, BE-installer-only
+// app-install sentinel reaches this; user/LLM commands cannot.
+func (e *Executor) ExecuteInstall(ctx context.Context, command string, timeout time.Duration) (*Result, error) {
+	if e.isHardBlocked(command) {
+		return nil, fmt.Errorf("command is blocked: %s", command)
+	}
+	if timeout == 0 {
+		timeout = e.defaultTimeout
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, e.shell, "-c", command)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	result := &Result{StartedAt: time.Now()}
+	err := cmd.Run()
+	result.FinishedAt = time.Now()
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.Error = err
+			result.ExitCode = -1
+		}
+	}
 	return result, nil
 }
 
@@ -279,14 +328,32 @@ func (e *Executor) streamPipe(wg *sync.WaitGroup, pipe io.ReadCloser, buf *bytes
 	}
 }
 
-func (e *Executor) isBlocked(cmd string) bool {
-	// Anchored regex catastrophes only — these are baked-in patterns
-	// that no configuration can re-enable. Even a malicious or
-	// misconfigured control plane sending these gets rejected.
+// isHardBlocked matches only the genuinely-catastrophic patterns
+// (filesystem nukes, mkfs/dd on disks, fork bombs, shutdown, disabling
+// cloudnan-agent). It deliberately EXCLUDES the curl|bash rule. This is the
+// floor that every execution path — including the trusted App Installer
+// path — must clear: relaxing curl|bash for first-party installs must never
+// also relax "brick the host" or "kill the agent".
+func (e *Executor) isHardBlocked(cmd string) bool {
 	for _, re := range hardBlockPatterns {
 		if re.MatchString(cmd) {
 			return true
 		}
+	}
+	return false
+}
+
+func (e *Executor) isBlocked(cmd string) bool {
+	// Anchored regex catastrophes only — these are baked-in patterns
+	// that no configuration can re-enable. Even a malicious or
+	// misconfigured control plane sending these gets rejected.
+	if e.isHardBlocked(cmd) {
+		return true
+	}
+	// curl|bash is blocked for every user/LLM-issued command; only the
+	// trusted ExecuteInstall path relaxes it.
+	if curlPipeShellPattern.MatchString(cmd) {
+		return true
 	}
 	// The user-configured BlockedCommands substring matcher was
 	// removed deliberately. It used strings.Contains, which means any
@@ -321,6 +388,12 @@ func MatchedHardBlock(cmd string) string {
 		if re.MatchString(cmd) {
 			return re.String()
 		}
+	}
+	// curl|bash lives in its own pattern (relaxed only on the trusted
+	// install path) but is still a user-command rejection reason, so
+	// report it here too.
+	if curlPipeShellPattern.MatchString(cmd) {
+		return curlPipeShellPattern.String()
 	}
 	return ""
 }

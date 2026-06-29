@@ -865,11 +865,14 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 				result, execErr = a.runSelfUninstall(execCtx, timeout)
 			case sentinelAppInstall:
 				// First-party App Installer / clone module command. The
-				// real shell line is Args[1]; run it through the trusted
-				// internal path so curl|bash-style catalog installs aren't
-				// refused by the user-command hard-block.
+				// real shell line is Args[1]. Route through ExecuteInstall,
+				// which relaxes ONLY the curl|bash rule while still
+				// enforcing the catastrophic hard-blocks (rm -rf of system
+				// dirs, mkfs/dd on disks, fork bombs, shutdown, disabling
+				// cloudnan-agent) — so this install bypass can't be turned
+				// into a host-bricking channel.
 				if len(cmd.Args) >= 2 {
-					result, execErr = a.runShellInternal(execCtx, cmd.Args[1], timeout)
+					result, execErr = a.executor.ExecuteInstall(execCtx, cmd.Args[1], timeout)
 				} else {
 					execErr = fmt.Errorf("app-install sentinel: missing install command in Args[1]")
 				}
