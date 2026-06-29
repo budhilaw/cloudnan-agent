@@ -151,6 +151,31 @@ func (h *Handler) ExecuteStreaming(
 			return errResult(fmt.Sprintf("restore_dump: %v", err))
 		}
 		return &Result{ExitCode: 0, Stdout: buf.String()}
+	case "supabase_migrate_dump":
+		if err := h.opSupabaseDump(ctx, args, bufferedEmit); err != nil {
+			return errResult(fmt.Sprintf("supabase_migrate_dump: %v", err))
+		}
+		return &Result{ExitCode: 0, Stdout: buf.String()}
+	case "supabase_migrate_restore":
+		if err := h.opSupabaseRestore(ctx, args, bufferedEmit); err != nil {
+			return errResult(fmt.Sprintf("supabase_migrate_restore: %v", err))
+		}
+		return &Result{ExitCode: 0, Stdout: buf.String()}
+	case "supabase_storage_sync":
+		if err := h.opSupabaseStorageSync(ctx, args, bufferedEmit); err != nil {
+			return errResult(fmt.Sprintf("supabase_storage_sync: %v", err))
+		}
+		return &Result{ExitCode: 0, Stdout: buf.String()}
+	case "supabase_verify":
+		if err := h.opSupabaseVerify(ctx, args, bufferedEmit); err != nil {
+			return errResult(fmt.Sprintf("supabase_verify: %v", err))
+		}
+		return &Result{ExitCode: 0, Stdout: buf.String()}
+	case "supabase_deploy_functions":
+		if err := h.opSupabaseDeployFunctions(ctx, args, bufferedEmit); err != nil {
+			return errResult(fmt.Sprintf("supabase_deploy_functions: %v", err))
+		}
+		return &Result{ExitCode: 0, Stdout: buf.String()}
 	default:
 		return errResult(fmt.Sprintf("op %q is not streaming or is unknown", op))
 	}
@@ -158,7 +183,13 @@ func (h *Handler) ExecuteStreaming(
 
 // IsStreamingOp reports whether the named op uses streaming chunks.
 func IsStreamingOp(op string) bool {
-	return op == "exec_query" || op == "export_dump" || op == "restore_dump"
+	switch op {
+	case "exec_query", "export_dump", "restore_dump",
+		"supabase_migrate_dump", "supabase_migrate_restore",
+		"supabase_storage_sync", "supabase_verify", "supabase_deploy_functions":
+		return true
+	}
+	return false
 }
 
 // ensureVault opens (or returns the cached) vault. Errors are sticky: once
