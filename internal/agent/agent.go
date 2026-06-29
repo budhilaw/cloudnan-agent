@@ -863,6 +863,16 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 				result, execErr = a.runSelfUpdate(execCtx, timeout)
 			case sentinelSelfUninstall:
 				result, execErr = a.runSelfUninstall(execCtx, timeout)
+			case sentinelAppInstall:
+				// First-party App Installer / clone module command. The
+				// real shell line is Args[1]; run it through the trusted
+				// internal path so curl|bash-style catalog installs aren't
+				// refused by the user-command hard-block.
+				if len(cmd.Args) >= 2 {
+					result, execErr = a.runShellInternal(execCtx, cmd.Args[1], timeout)
+				} else {
+					execErr = fmt.Errorf("app-install sentinel: missing install command in Args[1]")
+				}
 			default:
 				// Pass the command + its args separately so the
 				// executor can quote each arg properly. Joining them
@@ -1492,6 +1502,17 @@ func (a *Agent) checkModules(moduleIDs []string) *executor.Result {
 const (
 	sentinelSelfUpdate    = "__cloudnan_self_update__"
 	sentinelSelfUninstall = "__cloudnan_self_uninstall__"
+	// sentinelAppInstall marks a first-party App Installer / clone
+	// module command. The control plane's installer prepends it and
+	// passes the real shell line as Args[1]; the dispatcher runs that
+	// line through runShellInternal, bypassing the user-command
+	// hard-block so catalog installs that use the curl|bash idiom
+	// (docker, nodesource, redpanda, …) aren't refused. Same trust
+	// model as self-update: mTLS-locked, and the orchestrator's LLM
+	// tool surface never emits the sentinel, so only the BE installer
+	// can reach this path. Keep in sync with the "app_install" case in
+	// the control plane's command-type wire-up.
+	sentinelAppInstall = "__cloudnan_app_install__"
 )
 
 // runSelfUpdate downloads the current install script from the
