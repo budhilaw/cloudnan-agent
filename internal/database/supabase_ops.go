@@ -306,12 +306,26 @@ func (h *Handler) opSupabaseDeployFunctions(ctx context.Context, args []string, 
 		emit("deploy_functions: nothing supplied")
 		return nil
 	}
+	// functions_ref is customer-supplied. Reject a leading dash so it can't be
+	// smuggled as an argv flag (e.g. git's --upload-pack, an RCE vector), and
+	// only accept an https/git clone URL or an absolute local path — never an
+	// arbitrary option. The `--` terminator is belt-and-suspenders.
+	ref := strings.TrimSpace(env.FunctionsRef)
+	if strings.HasPrefix(ref, "-") {
+		return errors.New("invalid functions_ref")
+	}
 	dst := "/opt/cloudnan-supabase/supabase/docker/volumes/functions"
-	if _, err := runCapture(ctx, "git", []string{"clone", "--depth", "1", env.FunctionsRef, dst}, nil); err != nil {
-		// Not a git ref? fall back to a recursive copy of a local path.
-		if out, cpErr := runCapture(ctx, "cp", []string{"-a", env.FunctionsRef + "/.", dst}, nil); cpErr != nil {
-			return fmt.Errorf("deploy functions: %w: %s", cpErr, strings.TrimSpace(out))
+	switch {
+	case strings.HasPrefix(ref, "https://") || strings.HasPrefix(ref, "git@"):
+		if out, err := runCapture(ctx, "git", []string{"clone", "--depth", "1", "--", ref, dst}, nil); err != nil {
+			return fmt.Errorf("deploy functions (git): %w: %s", err, strings.TrimSpace(out))
 		}
+	case strings.HasPrefix(ref, "/"):
+		if out, err := runCapture(ctx, "cp", []string{"-a", "--", ref + "/.", dst}, nil); err != nil {
+			return fmt.Errorf("deploy functions (copy): %w: %s", err, strings.TrimSpace(out))
+		}
+	default:
+		return errors.New("functions_ref must be an https:// or git@ clone URL, or an absolute local path")
 	}
 	_, _ = runCapture(ctx, "docker", []string{"compose", "-f", "/opt/cloudnan-supabase/supabase/docker/docker-compose.yml", "restart", "functions"}, nil)
 	emit("deploy_functions: complete")
