@@ -367,6 +367,9 @@ func (h *Handler) opSupabaseCleanup(ctx context.Context, args []string, emit fun
 			_, _ = runCapture(ctx, "docker", []string{"compose", "-f", compose, "down", "-v"}, nil)
 		}
 	}
+	// Reclaim the working tree, including the bind-mounted ./pgdata that
+	// `compose down -v` leaves behind, so the next run starts from a clean slate.
+	_ = os.RemoveAll("/opt/cloudnan-supabase")
 	emit("cleanup: complete")
 	return nil
 }
