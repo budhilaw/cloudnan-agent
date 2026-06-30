@@ -49,6 +49,13 @@ type Agent struct {
 	running bool
 	version string
 
+	// cmdSendMu serializes Send on the command stream. Each command runs in
+	// its own goroutine (see runCommandStream), and gRPC forbids concurrent
+	// Send on one stream — without this lock a slow command's terminal
+	// response can race a routine command's and get dropped, leaving the
+	// control-plane waiter hung until timeout.
+	cmdSendMu sync.Mutex
+
 	// fastReconnect is set when the server requests an immediate reconnect
 	// (e.g. during a blue-green deploy). The reconnect loop uses 1s retry
 	// intervals for 30 attempts before falling back to normal backoff.
@@ -808,10 +815,18 @@ func (a *Agent) collectSnapshot() *pb.MetricsData {
 	return pbMetrics
 }
 
+// sendCmd serializes Send on the shared command stream. Commands each run in
+// their own goroutine, and gRPC forbids concurrent Send on a single stream.
+func (a *Agent) sendCmd(stream pb.AgentService_CommandStreamClient, resp *pb.CommandResponse) error {
+	a.cmdSendMu.Lock()
+	defer a.cmdSendMu.Unlock()
+	return stream.Send(resp)
+}
+
 // executeCommand runs a command and sends the response
 func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_CommandStreamClient, cmd *pb.Command) {
 	// Send running status
-	_ = stream.Send(&pb.CommandResponse{
+	_ = a.sendCmd(stream, &pb.CommandResponse{
 		CommandId: cmd.Id,
 		Status:    pb.CommandStatus_COMMAND_STATUS_RUNNING,
 	})
@@ -831,7 +846,7 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 	switch cmd.Type {
 	case pb.CommandType_COMMAND_TYPE_RECONNECT: // blue-green deploy handoff signal
 		// Acknowledge immediately, then trigger fast reconnect via the heartbeat loop.
-		_ = stream.Send(&pb.CommandResponse{
+		_ = a.sendCmd(stream, &pb.CommandResponse{
 			CommandId: cmd.Id,
 			Status:    pb.CommandStatus_COMMAND_STATUS_COMPLETED,
 			ExitCode:  0,
@@ -962,7 +977,7 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 		op := cmd.Args[0]
 		if database.IsStreamingOp(op) {
 			emit := func(chunk string) {
-				_ = stream.Send(&pb.CommandResponse{
+				_ = a.sendCmd(stream, &pb.CommandResponse{
 					CommandId: cmd.Id,
 					Status:    pb.CommandStatus_COMMAND_STATUS_RUNNING,
 					Stdout:    chunk,
@@ -1004,7 +1019,7 @@ func (a *Agent) executeCommand(ctx context.Context, stream pb.AgentService_Comma
 
 	log.Printf("Command %s completed: status=%v exit=%d", cmd.Id, resp.Status, resp.ExitCode)
 
-	if err := stream.Send(resp); err != nil {
+	if err := a.sendCmd(stream, resp); err != nil {
 		log.Printf("Failed to send command response: %v", err)
 	}
 }
