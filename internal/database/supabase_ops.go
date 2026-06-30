@@ -170,9 +170,15 @@ func (h *Handler) opSupabaseDump(ctx context.Context, args []string, emit func(s
 	if err != nil {
 		return err
 	}
-	rolesSQL, err := runCaptureStdout(ctx, prog, rargs, renv)
-	if err != nil {
-		return fmt.Errorf("roles dump: %w", err)
+	rolesSQL, rerr := runCaptureStdout(ctx, prog, rargs, renv)
+	if rerr != nil {
+		// Supabase's `postgres` user is not a true superuser, so
+		// `pg_dumpall --roles-only` (which reads pg_authid) is often denied.
+		// Roles aren't essential to restoring into a fresh stack — managed
+		// roles are filtered and user roles are rare — so warn and continue
+		// rather than abort the whole migration.
+		emit(fmt.Sprintf("dump: roles skipped (%v)", rerr))
+		rolesSQL = ""
 	}
 	if err := os.WriteFile(filepath.Join(dir, "roles.sql"), []byte(supabaseFilterRolesSQL(rolesSQL)), 0o600); err != nil {
 		return err
