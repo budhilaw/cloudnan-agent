@@ -176,6 +176,11 @@ func (h *Handler) ExecuteStreaming(
 			return errResult(fmt.Sprintf("supabase_deploy_functions: %v", err))
 		}
 		return &Result{ExitCode: 0, Stdout: buf.String()}
+	case "supabase_cleanup":
+		if err := h.opSupabaseCleanup(ctx, args, bufferedEmit); err != nil {
+			return errResult(fmt.Sprintf("supabase_cleanup: %v", err))
+		}
+		return &Result{ExitCode: 0, Stdout: buf.String()}
 	default:
 		return errResult(fmt.Sprintf("op %q is not streaming or is unknown", op))
 	}
@@ -186,7 +191,8 @@ func IsStreamingOp(op string) bool {
 	switch op {
 	case "exec_query", "export_dump", "restore_dump",
 		"supabase_migrate_dump", "supabase_migrate_restore",
-		"supabase_storage_sync", "supabase_verify", "supabase_deploy_functions":
+		"supabase_storage_sync", "supabase_verify", "supabase_deploy_functions",
+		"supabase_cleanup":
 		return true
 	}
 	return false

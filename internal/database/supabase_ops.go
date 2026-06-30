@@ -125,7 +125,17 @@ func runToFile(ctx context.Context, program string, args, extraEnv []string, out
 func runCaptureStdout(ctx context.Context, program string, args, extraEnv []string) (string, error) {
 	cmd := exec.CommandContext(ctx, program, args...)
 	cmd.Env = append(os.Environ(), extraEnv...)
+	// Capture stderr too: a psql/pg_dump failure (auth failed, can't connect)
+	// puts the real reason on stderr. Without this it collapses to a useless
+	// "exit status 1" and the run looks like it hung for no reason.
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return string(out), fmt.Errorf("%w: %s", err, msg)
+		}
+	}
 	return string(out), err
 }
 
@@ -145,8 +155,14 @@ func (h *Handler) opSupabaseDump(ctx context.Context, args []string, emit func(s
 		return err
 	}
 
-	// Discover the source schemas so user-created ones travel too.
-	schemas := supabaseMigrateSchemas(supabaseListSchemas(ctx, cred))
+	// Discover the source schemas (also our first connection: if the source
+	// is unreachable or the password is wrong, fail HERE with the real reason
+	// rather than letting it look like a hang).
+	srcSchemas, err := supabaseListSchemas(ctx, cred)
+	if err != nil {
+		return fmt.Errorf("connect to source: %w", err)
+	}
+	schemas := supabaseMigrateSchemas(srcSchemas)
 	emit(fmt.Sprintf("dump: migrating schemas %s", strings.Join(schemas, ", ")))
 
 	// roles pass.
@@ -319,6 +335,36 @@ func (h *Handler) opSupabaseDeployFunctions(ctx context.Context, args []string, 
 	return nil
 }
 
+// opSupabaseCleanup tears down what a cancelled/aborted migration left behind:
+// the dump artifacts on disk and any partial stack/db containers (compose
+// down -v removes the container + its volumes). Best-effort: a missing piece
+// is fine. A native systemd Postgres is intentionally left in place (removing
+// an apt-installed service on cancel would be too destructive); only the
+// migration's own artifacts and containers are reclaimed.
+func (h *Handler) opSupabaseCleanup(ctx context.Context, args []string, emit func(string)) error {
+	var env struct {
+		RunID             string `json:"run_id"`
+		ConfirmationToken string `json:"confirmation_token"`
+	}
+	if err := supabaseParse(args, &env); err != nil {
+		return err
+	}
+	if err := verifyOpToken(env.ConfirmationToken, "supabase_cleanup", env.RunID, "cleanup"); err != nil {
+		return err
+	}
+	// Dump artifacts for this run.
+	_ = os.RemoveAll(supabaseArtifactDir(env.RunID))
+	// Partial stack / db containers + their volumes.
+	for _, d := range []string{"/opt/cloudnan-supabase/db", "/opt/cloudnan-supabase/supabase/docker"} {
+		compose := filepath.Join(d, "docker-compose.yml")
+		if _, err := os.Stat(compose); err == nil {
+			_, _ = runCapture(ctx, "docker", []string{"compose", "-f", compose, "down", "-v"}, nil)
+		}
+	}
+	emit("cleanup: complete")
+	return nil
+}
+
 // --- shared helpers ---
 
 func supabaseParse(args []string, into any) error {
@@ -342,8 +388,9 @@ func supabaseRunWithStdin(ctx context.Context, program string, args, extraEnv []
 	return string(out), err
 }
 
-// supabaseListSchemas returns the source's schema names via psql.
-func supabaseListSchemas(ctx context.Context, cred *CredEntry) []string {
+// supabaseListSchemas returns the source's schema names via psql. Returns an
+// error (with the real psql message) when the connection itself fails.
+func supabaseListSchemas(ctx context.Context, cred *CredEntry) ([]string, error) {
 	args := append(supabasePgConnArgs(cred),
 		"--dbname="+supabaseDBName(""),
 		"--no-password", "-tAc",
@@ -352,7 +399,7 @@ func supabaseListSchemas(ctx context.Context, cred *CredEntry) []string {
 	env, _ := supabasePgConnEnv(cred)
 	out, err := runCaptureStdout(ctx, "psql", args, env)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var schemas []string
 	sc := bufio.NewScanner(strings.NewReader(out))
@@ -361,7 +408,7 @@ func supabaseListSchemas(ctx context.Context, cred *CredEntry) []string {
 			schemas = append(schemas, s)
 		}
 	}
-	return schemas
+	return schemas, nil
 }
 
 // supabaseScalarCount runs a single count query and returns the integer (0 on
