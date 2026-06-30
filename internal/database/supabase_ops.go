@@ -371,6 +371,33 @@ func (h *Handler) opSupabaseCleanup(ctx context.Context, args []string, emit fun
 	return nil
 }
 
+// opSupabaseProbe reports the source Postgres major version (via
+// server_version_num, e.g. 170006 -> 17) so the control plane can pin the
+// destination + this host's client to it. Emits just the major number.
+func (h *Handler) opSupabaseProbe(ctx context.Context, args []string, emit func(string)) error {
+	var env supabaseDumpEnv
+	if err := supabaseParse(args, &env); err != nil {
+		return err
+	}
+	if err := verifyOpToken(env.ConfirmationToken, "supabase_probe", env.RunID, env.Source.Database); err != nil {
+		return err
+	}
+	cred := env.Source.cred()
+	cargs := append(supabasePgConnArgs(cred),
+		"--dbname="+supabaseDBName(""), "--no-password", "-tAc", "SHOW server_version_num")
+	cenv, _ := supabasePgConnEnv(cred)
+	out, err := runCaptureStdout(ctx, "psql", cargs, cenv)
+	if err != nil {
+		return fmt.Errorf("probe source version: %w", err)
+	}
+	num, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || num <= 0 {
+		return fmt.Errorf("probe source version: unexpected %q", strings.TrimSpace(out))
+	}
+	emit(strconv.Itoa(num / 10000))
+	return nil
+}
+
 // --- shared helpers ---
 
 func supabaseParse(args []string, into any) error {
