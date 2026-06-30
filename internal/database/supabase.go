@@ -149,7 +149,10 @@ func supabasePgConnArgs(cred *CredEntry) []string {
 // materialized to a temp file (same helper the live driver uses). A
 // migration source is remote, so verify-full is the right default.
 func supabasePgConnEnv(cred *CredEntry) ([]string, error) {
-	env := []string{}
+	// Fail fast on an unreachable source instead of hanging the whole dump:
+	// a wrong host (e.g. the IPv6-only direct Supabase host on an IPv4 box)
+	// would otherwise block for many minutes with no feedback.
+	env := []string{"PGCONNECT_TIMEOUT=15"}
 	if cred.Password != "" {
 		env = append(env, "PGPASSWORD="+cred.Password)
 	}
