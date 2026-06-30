@@ -190,29 +190,24 @@ func supabaseRolesDumpArgs(cred *CredEntry) (program string, args []string, env 
 	return "pg_dumpall", args, env, nil
 }
 
-// supabaseSchemaDumpArgs builds the schema-only (dataOnly=false) or data-only
-// (dataOnly=true) pass: pg_dump -Fc restricted to the given schemas. Custom
-// format is restorable with pg_restore and supports the ordered restore the
-// orchestrator needs (schema pass, then data pass). --disable-triggers is NOT
-// set here: for -Fc it is honored on the pg_restore side, where the data pass
-// is replayed.
-func supabaseSchemaDumpArgs(cred *CredEntry, db string, schemas []string, dataOnly bool) (program string, args []string, env []string, err error) {
+// supabaseDumpArgs builds a SINGLE pg_dump -Fc of the given schemas (schema +
+// data in one archive). Doing one dump rather than separate schema-only and
+// data-only passes halves the catalogue introspection — the dominant cost when
+// dumping Supabase's auth/storage schemas over a cross-region pooler. Custom
+// format restores in dependency order via pg_restore, and --disable-triggers
+// is applied on the restore side so the data load order stays safe.
+func supabaseDumpArgs(cred *CredEntry, db string, schemas []string) (program string, args []string, env []string, err error) {
 	if cred == nil {
-		return "", nil, nil, errors.New("supabase schema dump: nil credentials")
+		return "", nil, nil, errors.New("supabase dump: nil credentials")
 	}
 	if strings.TrimSpace(db) == "" {
-		return "", nil, nil, errors.New("supabase schema dump: database name is required")
+		return "", nil, nil, errors.New("supabase dump: database name is required")
 	}
 	if len(schemas) == 0 {
-		return "", nil, nil, errors.New("supabase schema dump: at least one schema is required")
+		return "", nil, nil, errors.New("supabase dump: at least one schema is required")
 	}
 	args = supabasePgConnArgs(cred)
 	args = append(args, "-Fc", "--no-password", "--verbose")
-	if dataOnly {
-		args = append(args, "--data-only")
-	} else {
-		args = append(args, "--schema-only")
-	}
 	for _, s := range schemas {
 		args = append(args, "--schema="+s)
 	}
@@ -318,7 +313,7 @@ func supabaseRolesRestoreArgs(cred *CredEntry, db string) (program string, args 
 
 // supabaseRestoreArgs builds the pg_restore invocation for the schema
 // (dataOnly=false) or data (dataOnly=true) -Fc archive at artifactPath.
-func supabaseRestoreArgs(cred *CredEntry, db, artifactPath string, dataOnly bool) (program string, args []string, env []string, err error) {
+func supabaseRestoreArgs(cred *CredEntry, db, artifactPath string) (program string, args []string, env []string, err error) {
 	if cred == nil {
 		return "", nil, nil, errors.New("supabase restore: nil credentials")
 	}
@@ -330,13 +325,12 @@ func supabaseRestoreArgs(cred *CredEntry, db, artifactPath string, dataOnly bool
 		"--dbname="+supabaseDBName(db),
 		"--no-password",
 		"--verbose",
+		// pg_restore replays the single archive in dependency order
+		// (pre-data, data, post-data); --disable-triggers keeps the data
+		// load safe against FKs/RLS, then triggers come back with post-data.
+		"--disable-triggers",
+		artifactPath,
 	)
-	if dataOnly {
-		args = append(args, "--data-only", "--disable-triggers")
-	} else {
-		args = append(args, "--schema-only")
-	}
-	args = append(args, artifactPath)
 	env, err = supabasePgConnEnv(cred)
 	if err != nil {
 		return "", nil, nil, err

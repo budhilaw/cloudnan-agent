@@ -162,22 +162,14 @@ func (h *Handler) opSupabaseDump(ctx context.Context, args []string, emit func(s
 		return err
 	}
 
-	// schema pass.
-	prog, sargs, senv, err := supabaseSchemaDumpArgs(cred, env.Source.Database, schemas, false)
+	// single dump pass (schema + data in one -Fc archive).
+	prog, dargs, denv, err := supabaseDumpArgs(cred, env.Source.Database, schemas)
 	if err != nil {
 		return err
 	}
-	if err := runToFile(ctx, prog, sargs, senv, filepath.Join(dir, "schema.dump")); err != nil {
-		return fmt.Errorf("schema dump: %w", err)
-	}
-
-	// data pass.
-	prog, dargs, denv, err := supabaseSchemaDumpArgs(cred, env.Source.Database, schemas, true)
-	if err != nil {
-		return err
-	}
-	if err := runToFile(ctx, prog, dargs, denv, filepath.Join(dir, "data.dump")); err != nil {
-		return fmt.Errorf("data dump: %w", err)
+	emit("dump: dumping schema + data (this is the slow step over a remote pooler)…")
+	if err := runToFile(ctx, prog, dargs, denv, filepath.Join(dir, "dump.dump")); err != nil {
+		return fmt.Errorf("dump: %w", err)
 	}
 	emit("dump: complete")
 	return nil
@@ -207,22 +199,17 @@ func (h *Handler) opSupabaseRestore(ctx context.Context, args []string, emit fun
 		return fmt.Errorf("roles restore: %w: %s", err, out)
 	}
 
-	// schema, then data.
-	for _, pass := range []struct {
-		file     string
-		dataOnly bool
-		label    string
-	}{{"schema.dump", false, "schema"}, {"data.dump", true, "data"}} {
-		prog, pargs, penv, err := supabaseRestoreArgs(target, env.Target.Database, filepath.Join(dir, pass.file), pass.dataOnly)
-		if err != nil {
-			return err
-		}
-		// pg_restore can report ignorable errors on objects the stack
-		// pre-owns; surface output but don't abort on a non-zero exit if the
-		// archive applied (best-effort, verify is the gate).
-		if out, err := runCapture(ctx, prog, pargs, penv); err != nil {
-			emit(fmt.Sprintf("restore %s: %v (continuing; verify will reconcile): %s", pass.label, err, strings.TrimSpace(out)))
-		}
+	// single pg_restore of the combined archive (pg_restore orders pre-data,
+	// data, post-data itself).
+	prog, pargs, penv, err := supabaseRestoreArgs(target, env.Target.Database, filepath.Join(dir, "dump.dump"))
+	if err != nil {
+		return err
+	}
+	// pg_restore can report ignorable errors on objects the stack pre-owns;
+	// surface output but don't abort on a non-zero exit if the archive
+	// applied (best-effort, verify is the gate).
+	if out, err := runCapture(ctx, prog, pargs, penv); err != nil {
+		emit(fmt.Sprintf("restore: %v (continuing; verify will reconcile): %s", err, strings.TrimSpace(out)))
 	}
 	emit("restore: complete")
 	return nil
