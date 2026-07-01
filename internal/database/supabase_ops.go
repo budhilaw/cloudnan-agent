@@ -40,6 +40,24 @@ type supabasePgConn struct {
 	Password string `json:"password"`
 	Database string `json:"database"`
 	UseTLS   bool   `json:"use_tls"`
+	// Container, when set, means the destination Postgres is only reachable
+	// inside this Docker container (the full Supabase stack keeps its DB
+	// internal, unpublished). Restore/verify then run their client via
+	// `docker exec -u postgres <container>` against the DB's local socket.
+	Container string `json:"container,omitempty"`
+}
+
+// supabaseContainerExecArgs builds a `docker exec -u postgres [-i] <container>
+// <tool> -d <db> <extra...>` invocation: run a Postgres client INSIDE the
+// destination DB container as the postgres superuser (local socket, no host/
+// port/password). Bulletproof for the full stack, whose DB isn't published.
+func supabaseContainerExecArgs(container, db, tool string, stdin bool, extra ...string) []string {
+	a := []string{"exec", "-u", "postgres"}
+	if stdin {
+		a = append(a, "-i")
+	}
+	a = append(a, container, tool, "-d", supabaseDBName(db))
+	return append(a, extra...)
 }
 
 func (c supabasePgConn) cred() *CredEntry {
@@ -210,28 +228,45 @@ func (h *Handler) opSupabaseRestore(ctx context.Context, args []string, emit fun
 	if target.Password == "" {
 		target.Password = supabaseReadStackPostgresPassword()
 	}
+	container := env.Target.Container
+	db := env.Target.Database
 	dir := supabaseArtifactDir(env.RunID)
+	rolesFile := filepath.Join(dir, "roles.sql")
+	dumpFile := filepath.Join(dir, "dump.dump")
 
-	// roles.
-	prog, rargs, renv, err := supabaseRolesRestoreArgs(target, env.Target.Database)
-	if err != nil {
-		return err
+	// roles (psql, SQL from stdin).
+	var rprog string
+	var rargs, renv []string
+	if container != "" {
+		rprog = "docker"
+		rargs = supabaseContainerExecArgs(container, db, "psql", true, "-v", "ON_ERROR_STOP=0", "-f", "-")
+	} else {
+		var err error
+		if rprog, rargs, renv, err = supabaseRolesRestoreArgs(target, db); err != nil {
+			return err
+		}
 	}
-	if out, err := supabaseRunWithStdin(ctx, prog, rargs, renv, filepath.Join(dir, "roles.sql")); err != nil {
+	if out, err := supabaseRunWithStdin(ctx, rprog, rargs, renv, rolesFile); err != nil {
 		return fmt.Errorf("roles restore: %w: %s", err, out)
 	}
 
 	// single pg_restore of the combined archive (pg_restore orders pre-data,
-	// data, post-data itself).
-	prog, pargs, penv, err := supabaseRestoreArgs(target, env.Target.Database, filepath.Join(dir, "dump.dump"))
-	if err != nil {
-		return err
-	}
-	// pg_restore can report ignorable errors on objects the stack pre-owns;
-	// surface output but don't abort on a non-zero exit if the archive
-	// applied (best-effort, verify is the gate).
-	if out, err := runCapture(ctx, prog, pargs, penv); err != nil {
-		emit(fmt.Sprintf("restore: %v (continuing; verify will reconcile): %s", err, strings.TrimSpace(out)))
+	// data, post-data itself). Best-effort: it can report ignorable errors on
+	// objects the stack pre-owns; verify is the gate.
+	if container != "" {
+		// pg_restore reads the -Fc archive from stdin when no file arg given.
+		pargs := supabaseContainerExecArgs(container, db, "pg_restore", true, "--verbose", "--disable-triggers")
+		if out, err := supabaseRunWithStdin(ctx, "docker", pargs, nil, dumpFile); err != nil {
+			emit(fmt.Sprintf("restore: %v (continuing; verify will reconcile): %s", err, strings.TrimSpace(out)))
+		}
+	} else {
+		prog, pargs, penv, err := supabaseRestoreArgs(target, db, dumpFile)
+		if err != nil {
+			return err
+		}
+		if out, err := runCapture(ctx, prog, pargs, penv); err != nil {
+			emit(fmt.Sprintf("restore: %v (continuing; verify will reconcile): %s", err, strings.TrimSpace(out)))
+		}
 	}
 	emit("restore: complete")
 	return nil
@@ -286,8 +321,8 @@ func (h *Handler) opSupabaseVerify(ctx context.Context, args []string, emit func
 	}
 	report := map[string]map[string]int{"source": {}, "destination": {}}
 	for name, query := range SupabaseVerifyQueries {
-		report["source"][name] = supabaseScalarCount(ctx, env.Source.cred(), env.Source.Database, query)
-		report["destination"][name] = supabaseScalarCount(ctx, target, env.Target.Database, query)
+		report["source"][name] = supabaseScalarCount(ctx, env.Source.cred(), "", env.Source.Database, query)
+		report["destination"][name] = supabaseScalarCount(ctx, target, env.Target.Container, env.Target.Database, query)
 	}
 	out, err := json.Marshal(report)
 	if err != nil {
@@ -462,10 +497,19 @@ func supabaseListSchemas(ctx context.Context, cred *CredEntry) ([]string, error)
 
 // supabaseScalarCount runs a single count query and returns the integer (0 on
 // any error — the report shows the mismatch).
-func supabaseScalarCount(ctx context.Context, cred *CredEntry, db, query string) int {
-	args := append(supabasePgConnArgs(cred), "--dbname="+supabaseDBName(db), "--no-password", "-tAc", query)
-	env, _ := supabasePgConnEnv(cred)
-	out, err := runCaptureStdout(ctx, "psql", args, env)
+func supabaseScalarCount(ctx context.Context, cred *CredEntry, container, db, query string) int {
+	var program string
+	var args, env []string
+	if container != "" {
+		// Destination on the full stack: count inside the DB container.
+		program = "docker"
+		args = supabaseContainerExecArgs(container, db, "psql", false, "-tAc", query)
+	} else {
+		program = "psql"
+		args = append(supabasePgConnArgs(cred), "--dbname="+supabaseDBName(db), "--no-password", "-tAc", query)
+		env, _ = supabasePgConnEnv(cred)
+	}
+	out, err := runCaptureStdout(ctx, program, args, env)
 	if err != nil {
 		return 0
 	}
