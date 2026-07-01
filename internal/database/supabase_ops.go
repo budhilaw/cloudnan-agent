@@ -64,9 +64,9 @@ func supabaseContainerExecArgs(container, db, tool string, stdin bool, extra ...
 // each must have its password equal to POSTGRES_PASSWORD. A restore of the
 // source can overwrite these, breaking Auth/REST/Storage/etc.
 var supabaseStackServiceRoles = []string{
-	"supabase_auth_admin", "authenticator", "supabase_storage_admin",
-	"supabase_functions_admin", "supabase_admin", "pgbouncer",
-	"supabase_replication_admin", "supabase_read_only_user",
+	"postgres", "supabase_admin", "supabase_auth_admin", "authenticator",
+	"supabase_storage_admin", "supabase_functions_admin", "pgbouncer",
+	"supabase_replication_admin", "supabase_read_only_user", "dashboard_user",
 }
 
 // supabaseResetStackRolePasswords resets the full stack's service-role
