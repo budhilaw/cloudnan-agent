@@ -60,6 +60,32 @@ func supabaseContainerExecArgs(container, db, tool string, stdin bool, extra ...
 	return append(a, extra...)
 }
 
+// supabaseStackServiceRoles are the roles the full stack's services connect as;
+// each must have its password equal to POSTGRES_PASSWORD. A restore of the
+// source can overwrite these, breaking Auth/REST/Storage/etc.
+var supabaseStackServiceRoles = []string{
+	"supabase_auth_admin", "authenticator", "supabase_storage_admin",
+	"supabase_functions_admin", "supabase_admin", "pgbouncer",
+	"supabase_replication_admin", "supabase_read_only_user",
+}
+
+// supabaseResetStackRolePasswords resets the full stack's service-role
+// passwords to the stack's own POSTGRES_PASSWORD after a restore, so
+// gotrue/postgrest/storage/etc. can authenticate again. Best-effort per role
+// (a role the source didn't have is simply skipped).
+func supabaseResetStackRolePasswords(ctx context.Context, container, db, pw string, emit func(string)) {
+	if container == "" || pw == "" {
+		return
+	}
+	lit := "'" + strings.ReplaceAll(pw, "'", "''") + "'"
+	for _, r := range supabaseStackServiceRoles {
+		args := supabaseContainerExecArgs(container, db, "psql", false,
+			"-v", "ON_ERROR_STOP=0", "-c", "ALTER ROLE "+r+" WITH PASSWORD "+lit)
+		_, _ = runCapture(ctx, "docker", args, nil)
+	}
+	emit("restore: reset stack service-role passwords")
+}
+
 func (c supabasePgConn) cred() *CredEntry {
 	port := c.Port
 	if port == 0 {
@@ -268,6 +294,10 @@ func (h *Handler) opSupabaseRestore(ctx context.Context, args []string, emit fun
 			emit(fmt.Sprintf("restore: %v (continuing; verify will reconcile): %s", err, strings.TrimSpace(out)))
 		}
 	}
+	// Full stack: the restore can clobber the service roles' passwords, which
+	// breaks Auth/REST/Storage. Reset them to the stack password so those
+	// services can reconnect. No-op for db_only (no container).
+	supabaseResetStackRolePasswords(ctx, container, db, target.Password, emit)
 	emit("restore: complete")
 	return nil
 }
