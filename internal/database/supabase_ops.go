@@ -364,8 +364,17 @@ func (h *Handler) opSupabaseCleanup(ctx context.Context, args []string, emit fun
 	for _, d := range []string{"/opt/cloudnan-supabase/db", "/opt/cloudnan-supabase/supabase/docker"} {
 		compose := filepath.Join(d, "docker-compose.yml")
 		if _, err := os.Stat(compose); err == nil {
-			_, _ = runCapture(ctx, "docker", []string{"compose", "-f", compose, "down", "-v"}, nil)
+			_, _ = runCapture(ctx, "docker", []string{
+				"compose", "-f", compose, "down", "-v", "--remove-orphans", "--timeout", "30",
+			}, nil)
 		}
+	}
+	// Force-remove any stragglers `compose down` didn't reap (a slow DB, an
+	// override change, a lost compose file) BEFORE we delete the working tree —
+	// otherwise deleting the dir orphans still-running containers.
+	for _, project := range []string{"supabase", supabaseDBComposeProject} {
+		_, _ = runCapture(ctx, "sh", []string{"-c",
+			"docker ps -aq --filter label=com.docker.compose.project=" + project + " | xargs -r docker rm -f"}, nil)
 	}
 	// Reclaim the working tree, including the bind-mounted ./pgdata that
 	// `compose down -v` leaves behind, so the next run starts from a clean slate.
@@ -373,6 +382,10 @@ func (h *Handler) opSupabaseCleanup(ctx context.Context, args []string, emit fun
 	emit("cleanup: complete")
 	return nil
 }
+
+// supabaseDBComposeProject is the compose project name of the db_only stack
+// (set via `name:` in the bring-up). The full stack's project is "supabase".
+const supabaseDBComposeProject = "cloudnan-supabase-clone"
 
 // opSupabaseProbe reports the source Postgres major version (via
 // server_version_num, e.g. 170006 -> 17) so the control plane can pin the
