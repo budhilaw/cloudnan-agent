@@ -75,6 +75,24 @@ logging:
   # Enable log streaming to Control Plane
   stream_to_control_plane: true
 
+# App-log shipper — streams Docker container, systemd unit, and agent logs to
+# the control plane over the existing StreamLogs RPC (surfaced on the Logs page).
+# All toggles default ON when omitted, so upgrading agents start shipping; set a
+# toggle to false to opt out. Sources are tagged docker:<name> / systemd:<unit> /
+# agent.
+log_shipper:
+  # Master switch for the shipper.
+  enabled: true
+  # Follow every running Docker container's stdout/stderr.
+  all_containers: true
+  # Stream the agent's own log (source "agent") — gives a fresh box logs even
+  # with no Docker/services running.
+  ship_agent_log: true
+  # Extra systemd units to follow via `journalctl -u <unit>`.
+  units: []
+    # - nginx.service
+    # - postgresql.service
+
 # Command execution
 executor:
   # Default shell for command execution

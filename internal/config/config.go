@@ -16,7 +16,31 @@ type Config struct {
 	Metrics      MetricsConfig      `yaml:"metrics"`
 	Logging      LoggingConfig      `yaml:"logging"`
 	Executor     ExecutorConfig     `yaml:"executor"`
+	LogShipper   LogShipperConfig   `yaml:"log_shipper"`
 }
+
+// LogShipperConfig controls the app-log shipper (Docker containers + systemd
+// units + the agent's own log), streamed to the control plane over StreamLogs.
+// The three toggles are pointers so an ABSENT key defaults on (existing
+// agent.yaml files predate this section and must start shipping on upgrade),
+// while an explicit `false` is honoured.
+type LogShipperConfig struct {
+	Enabled       *bool    `yaml:"enabled"`
+	AllContainers *bool    `yaml:"all_containers"` // follow every running Docker container
+	ShipAgentLog  *bool    `yaml:"ship_agent_log"` // tee the agent's own log as source "agent"
+	Units         []string `yaml:"units"`          // extra systemd units to follow (journalctl -u)
+}
+
+func boolOrTrue(p *bool) bool { return p == nil || *p }
+
+// IsEnabled reports whether the shipper runs at all.
+func (c LogShipperConfig) IsEnabled() bool { return boolOrTrue(c.Enabled) }
+
+// FollowAllContainers reports whether to follow every running container.
+func (c LogShipperConfig) FollowAllContainers() bool { return boolOrTrue(c.AllContainers) }
+
+// ShipsAgentLog reports whether to stream the agent's own log lines.
+func (c LogShipperConfig) ShipsAgentLog() bool { return boolOrTrue(c.ShipAgentLog) }
 
 type AgentConfig struct {
 	ID     string            `yaml:"id"`

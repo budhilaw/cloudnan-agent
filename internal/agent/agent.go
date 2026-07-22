@@ -83,6 +83,11 @@ type Agent struct {
 	// lapses and the agent never falsely shows "Agent Not Responding" while
 	// its heartbeat is still healthy.
 	latestMetrics atomic.Pointer[pb.MetricsData]
+
+	// logRing buffers collected app-log lines (Docker/systemd/agent) between the
+	// shipper's collectors and the per-connection StreamLogs sender. Created once
+	// by startLogCollectors; nil when the log shipper is disabled.
+	logRing *lineRing
 }
 
 // New creates a new Agent
@@ -157,6 +162,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	// slow probe on a busy box from stalling metric delivery (the cause of the
 	// false "Agent Not Responding" while heartbeats stayed healthy).
 	go a.runMetricsCollector(ctx)
+
+	// Launch the log-shipper collectors once for the agent's whole lifetime
+	// (root ctx), same rationale as the metrics collector: producers survive
+	// reconnects; the per-connection sender (runLogStream) just drains the ring.
+	a.startLogCollectors(ctx)
 
 	for {
 		if ctx.Err() != nil {
@@ -316,6 +326,7 @@ func (a *Agent) connect(ctx context.Context) error {
 
 	go a.runCommandStream(commandCtx, client, a.cfg.Agent.Token)
 	go a.runMetricsStream(commandCtx, client, a.cfg.Agent.Token)
+	go a.runLogStream(commandCtx, client, a.cfg.Agent.Token)
 
 	// Fire one heartbeat immediately so the agent picks up the
 	// op_token_secret (and any pending reconnect signal) within seconds
