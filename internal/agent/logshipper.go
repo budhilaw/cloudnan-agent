@@ -173,17 +173,23 @@ func (a *Agent) startLogCollectors(ctx context.Context) {
 			log.Println("[logshipper] docker not found — skipping container log shipping")
 		}
 	}
-	if len(a.cfg.LogShipper.Units) > 0 {
+	if a.cfg.LogShipper.FollowsSystemdUnits() {
 		if _, err := exec.LookPath("journalctl"); err == nil {
-			for _, unit := range a.cfg.LogShipper.Units {
-				go a.runJournaldFollower(ctx, unit)
-			}
+			go a.runSystemdFollower(ctx)
 		} else {
 			log.Println("[logshipper] journalctl not found — skipping systemd unit shipping")
 		}
 	}
-	log.Printf("[logshipper] enabled (agent_log=%v containers=%v units=%d)",
-		a.cfg.LogShipper.ShipsAgentLog(), a.cfg.LogShipper.FollowAllContainers(), len(a.cfg.LogShipper.Units))
+	if a.cfg.LogShipper.FollowsAppLogs() {
+		if _, err := exec.LookPath("tail"); err == nil {
+			go a.runAppFollower(ctx)
+		} else {
+			log.Println("[logshipper] tail not found — skipping app log shipping")
+		}
+	}
+	log.Printf("[logshipper] enabled (agent_log=%v containers=%v systemd=%v app=%v)",
+		a.cfg.LogShipper.ShipsAgentLog(), a.cfg.LogShipper.FollowAllContainers(),
+		a.cfg.LogShipper.FollowsSystemdUnits(), a.cfg.LogShipper.FollowsAppLogs())
 }
 
 // runDockerFollower discovers running containers and follows each one's logs,
@@ -283,6 +289,92 @@ func (a *Agent) runJournaldFollower(ctx context.Context, unit string) {
 		stdout, err := cmd.StdoutPipe()
 		if err == nil && cmd.Start() == nil {
 			a.scanLines(stdout, source, false)
+			_ = cmd.Wait()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// runSystemdFollower follows the catalog-matched systemd units on the box
+// (plus any configured extras), re-discovering periodically so a newly
+// installed service starts shipping without an agent restart. Each unit gets
+// one long-lived runJournaldFollower; units are never un-followed (a removed
+// unit's journalctl -f simply idles, and its crash tail stays valuable).
+func (a *Agent) runSystemdFollower(ctx context.Context) {
+	followed := make(map[string]struct{})
+	discover := func() {
+		for _, unit := range discoverSystemdUnits(ctx, a.cfg.LogShipper.Units) {
+			if _, ok := followed[unit]; ok {
+				continue
+			}
+			followed[unit] = struct{}{}
+			go a.runJournaldFollower(ctx, unit)
+		}
+	}
+	discover()
+	ticker := time.NewTicker(sourceRediscoverInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			discover()
+		}
+	}
+}
+
+// runAppFollower discovers per-site application log files from the web server's
+// vhosts + framework conventions and tails each one, re-discovering on a timer
+// so a newly deployed site starts shipping without a restart. Files are keyed
+// by path so the same file (e.g. a shared error log) is followed once.
+func (a *Agent) runAppFollower(ctx context.Context) {
+	followed := make(map[string]struct{})
+	discover := func() {
+		for _, t := range discoverAppLogTargets() {
+			for _, f := range t.files {
+				if _, ok := followed[f.path]; ok {
+					continue
+				}
+				followed[f.path] = struct{}{}
+				go a.runAppFileFollower(ctx, t.site, f.path, f.isError)
+			}
+		}
+	}
+	discover()
+	ticker := time.NewTicker(sourceRediscoverInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			discover()
+		}
+	}
+}
+
+// runAppFileFollower tails one application log file as source "app:<site>".
+// `tail -F` follows the path across rotation/truncation (reopening on rename),
+// so a logrotate cycle doesn't stop the stream. Starts at the tail (-n 0) so
+// existing history isn't re-shipped, and reconnects with a fixed delay if tail
+// exits (e.g. the file's directory is briefly absent mid-deploy).
+func (a *Agent) runAppFileFollower(ctx context.Context, site, path string, isError bool) {
+	source := "app:" + site
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		cmd := exec.CommandContext(ctx, "tail", "-F", "-n", "0", path)
+		stdout, err := cmd.StdoutPipe()
+		if err == nil && cmd.Start() == nil {
+			a.scanLines(stdout, source, isError)
 			_ = cmd.Wait()
 		}
 		select {

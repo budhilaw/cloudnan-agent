@@ -85,13 +85,23 @@ log_shipper:
   enabled: true
   # Follow every running Docker container's stdout/stderr.
   all_containers: true
+  # Follow systemd units auto-selected from a known-service catalog (web
+  # servers, PHP-FPM, databases, docker/supervisor/cron, and security units
+  # like fail2ban/sshd). Only units actually loaded on the box are followed, so
+  # kernel/udev/internal units are never shipped. Works the same whether
+  # Cloudnan installed the stack or the box was built by hand and adopted.
+  systemd_units: true
+  # Follow per-site application logs discovered from the web server's vhosts
+  # (nginx access_log/error_log, apache CustomLog/ErrorLog) plus framework logs
+  # (WordPress wp-content/debug.log, Laravel storage/logs). Tagged app:<domain>.
+  app_logs: true
   # Stream the agent's own log (source "agent") — gives a fresh box logs even
   # with no Docker/services running.
   ship_agent_log: true
-  # Extra systemd units to follow via `journalctl -u <unit>`.
+  # Extra systemd units to follow ON TOP OF the catalog (for custom units the
+  # catalog doesn't know, e.g. your own app service).
   units: []
-    # - nginx.service
-    # - postgresql.service
+    # - myapp.service
 
 # Command execution
 executor:

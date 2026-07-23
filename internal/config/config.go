@@ -19,16 +19,22 @@ type Config struct {
 	LogShipper   LogShipperConfig   `yaml:"log_shipper"`
 }
 
-// LogShipperConfig controls the app-log shipper (Docker containers + systemd
-// units + the agent's own log), streamed to the control plane over StreamLogs.
-// The three toggles are pointers so an ABSENT key defaults on (existing
-// agent.yaml files predate this section and must start shipping on upgrade),
-// while an explicit `false` is honoured.
+// LogShipperConfig controls the app-log shipper, streamed to the control plane
+// over StreamLogs. It ships four sources: Docker containers, systemd units
+// (auto-selected from a known-service catalog so kernel/udev/internal units are
+// never followed — see logsources.go), per-site application logs (nginx/apache
+// vhost logs + framework logs like WordPress/Laravel), and the agent's own log.
+// The toggles are pointers so an ABSENT key defaults on (existing agent.yaml
+// files predate this section and must start shipping on upgrade), while an
+// explicit `false` is honoured. Units is an ADDITIVE override: units named here
+// are followed on top of the auto-selected catalog set.
 type LogShipperConfig struct {
 	Enabled       *bool    `yaml:"enabled"`
 	AllContainers *bool    `yaml:"all_containers"` // follow every running Docker container
+	SystemdUnits  *bool    `yaml:"systemd_units"`  // follow catalog-matched systemd units
+	AppLogs       *bool    `yaml:"app_logs"`       // follow per-site application logs
 	ShipAgentLog  *bool    `yaml:"ship_agent_log"` // tee the agent's own log as source "agent"
-	Units         []string `yaml:"units"`          // extra systemd units to follow (journalctl -u)
+	Units         []string `yaml:"units"`          // extra systemd units to follow, on top of the catalog
 }
 
 func boolOrTrue(p *bool) bool { return p == nil || *p }
@@ -38,6 +44,12 @@ func (c LogShipperConfig) IsEnabled() bool { return boolOrTrue(c.Enabled) }
 
 // FollowAllContainers reports whether to follow every running container.
 func (c LogShipperConfig) FollowAllContainers() bool { return boolOrTrue(c.AllContainers) }
+
+// FollowsSystemdUnits reports whether to follow catalog-matched systemd units.
+func (c LogShipperConfig) FollowsSystemdUnits() bool { return boolOrTrue(c.SystemdUnits) }
+
+// FollowsAppLogs reports whether to follow per-site application logs.
+func (c LogShipperConfig) FollowsAppLogs() bool { return boolOrTrue(c.AppLogs) }
 
 // ShipsAgentLog reports whether to stream the agent's own log lines.
 func (c LogShipperConfig) ShipsAgentLog() bool { return boolOrTrue(c.ShipAgentLog) }
