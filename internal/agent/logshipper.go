@@ -275,10 +275,11 @@ func (a *Agent) followContainer(ctx context.Context, id, name string) {
 	_ = cmd.Wait()
 }
 
-// runJournaldFollower follows one systemd unit via `journalctl -f`. The
-// subprocess (not libsystemd) keeps the agent a static binary.
-func (a *Agent) runJournaldFollower(ctx context.Context, unit string) {
-	source := "systemd:" + unit
+// runJournaldFollower follows one systemd unit via `journalctl -f`, shipping
+// its lines under the given source tag (systemd:<unit> for infra services,
+// app:<unit> for customer application units). The subprocess (not libsystemd)
+// keeps the agent a static binary.
+func (a *Agent) runJournaldFollower(ctx context.Context, unit, source string) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -312,7 +313,7 @@ func (a *Agent) runSystemdFollower(ctx context.Context) {
 				continue
 			}
 			followed[unit] = struct{}{}
-			go a.runJournaldFollower(ctx, unit)
+			go a.runJournaldFollower(ctx, unit, "systemd:"+unit)
 		}
 	}
 	discover()
@@ -328,20 +329,34 @@ func (a *Agent) runSystemdFollower(ctx context.Context) {
 	}
 }
 
-// runAppFollower discovers per-site application log files from the web server's
-// vhosts + framework conventions and tails each one, re-discovering on a timer
-// so a newly deployed site starts shipping without a restart. Files are keyed
-// by path so the same file (e.g. a shared error log) is followed once.
+// runAppFollower ships the App source: per-site log FILES discovered from the
+// web server's vhosts + framework conventions, AND customer application systemd
+// UNITS (a Go/Node/Python/etc. binary run as its own service, which the vhost
+// scanner and the known-service catalog both miss). Both are re-discovered on a
+// timer so a newly deployed site or service starts shipping without a restart.
+// The followed set is keyed with distinct "file:"/"unit:" prefixes so a file
+// path and a unit name can never collide.
 func (a *Agent) runAppFollower(ctx context.Context) {
 	followed := make(map[string]struct{})
 	discover := func() {
 		for _, t := range discoverAppLogTargets() {
 			for _, f := range t.files {
-				if _, ok := followed[f.path]; ok {
+				key := "file:" + f.path
+				if _, ok := followed[key]; ok {
 					continue
 				}
-				followed[f.path] = struct{}{}
+				followed[key] = struct{}{}
 				go a.runAppFileFollower(ctx, t.site, f.path, f.isError)
+			}
+		}
+		if _, err := exec.LookPath("journalctl"); err == nil {
+			for _, unit := range discoverAppUnits(ctx, agentSystemdUnit) {
+				key := "unit:" + unit
+				if _, ok := followed[key]; ok {
+					continue
+				}
+				followed[key] = struct{}{}
+				go a.runJournaldFollower(ctx, unit, "app:"+unit)
 			}
 		}
 	}

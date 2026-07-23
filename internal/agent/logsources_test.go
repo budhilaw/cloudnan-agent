@@ -40,6 +40,49 @@ func TestIsKnownServiceUnit(t *testing.T) {
 	}
 }
 
+func TestIsAppUnit(t *testing.T) {
+	cases := []struct {
+		name     string
+		fragment string
+		exec     string
+		want     bool
+	}{
+		// Customer apps (any language) run as their own service — the whole point.
+		{"go binary in /opt", "/etc/systemd/system/cloudnan-test.service", "/opt/cloudnan-test/bin/server", true},
+		{"node app in /home", "/etc/systemd/system/myapp.service", "/home/deploy/app/index.js", true},
+		{"python in /srv", "/etc/systemd/system/api.service", "/srv/api/venv/bin/python", true},
+		{"binary in /usr/local/bin", "/etc/systemd/system/worker.service", "/usr/local/bin/worker", true},
+		{"app in /var/www", "/etc/systemd/system/site.service", "/var/www/site/server", true},
+		// OS daemons: locally-authored dir but a SYSTEM binary path → not an app.
+		{"system daemon in /usr/sbin", "/etc/systemd/system/custom.service", "/usr/sbin/customd", false},
+		{"system binary in /usr/bin", "/etc/systemd/system/thing.service", "/usr/bin/thing", false},
+		// Vendor daemon: app-ish binary but vendor unit dir → not locally authored.
+		{"vendor unit dir", "/lib/systemd/system/foo.service", "/usr/local/bin/foo", false},
+		{"usr-lib vendor dir", "/usr/lib/systemd/system/bar.service", "/opt/bar/bar", false},
+		// No fragment path (transient/generated unit).
+		{"empty fragment", "", "/opt/x/x", false},
+	}
+	for _, c := range cases {
+		if got := isAppUnit(c.fragment, c.exec); got != c.want {
+			t.Errorf("%s: isAppUnit(%q,%q)=%v want %v", c.name, c.fragment, c.exec, got, c.want)
+		}
+	}
+}
+
+func TestParseExecStartPath(t *testing.T) {
+	cases := map[string]string{
+		"{ path=/opt/app/bin/server ; argv[]=/opt/app/bin/server --flag ; ignore_errors=no }": "/opt/app/bin/server",
+		"{ path=/usr/local/bin/worker }": "/usr/local/bin/worker",
+		"/usr/sbin/plain-form --daemon":  "/usr/sbin/plain-form",
+		"":                               "",
+	}
+	for in, want := range cases {
+		if got := parseExecStartPath(in); got != want {
+			t.Errorf("parseExecStartPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestBaseUnitName(t *testing.T) {
 	cases := map[string]string{
 		"nginx.service":              "nginx",

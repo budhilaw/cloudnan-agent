@@ -93,23 +93,9 @@ func discoverSystemdUnits(ctx context.Context, extra []string) []string {
 			set[u] = struct{}{}
 		}
 	}
-	if _, err := exec.LookPath("systemctl"); err == nil {
-		cctx, cancel := context.WithTimeout(ctx, sourceDiscoveryTimeout)
-		defer cancel()
-		cmd := exec.CommandContext(cctx, "systemctl",
-			"list-units", "--type=service", "--no-legend", "--state=loaded", "--plain")
-		if out, err := cmd.Output(); err == nil {
-			sc := bufio.NewScanner(strings.NewReader(string(out)))
-			for sc.Scan() {
-				fields := strings.Fields(strings.TrimSpace(sc.Text()))
-				if len(fields) == 0 {
-					continue
-				}
-				unit := fields[0]
-				if isKnownServiceUnit(unit) {
-					set[unit] = struct{}{}
-				}
-			}
+	for _, unit := range listLoadedServiceUnits(ctx) {
+		if isKnownServiceUnit(unit) {
+			set[unit] = struct{}{}
 		}
 	}
 	units := make([]string, 0, len(set))
@@ -118,6 +104,165 @@ func discoverSystemdUnits(ctx context.Context, extra []string) []string {
 	}
 	sort.Strings(units)
 	return units
+}
+
+// listLoadedServiceUnits returns every loaded service unit name on the box.
+// Best-effort: empty on a non-systemd host or a failing systemctl.
+func listLoadedServiceUnits(ctx context.Context) []string {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, sourceDiscoveryTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "systemctl",
+		"list-units", "--type=service", "--no-legend", "--state=loaded", "--plain")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var units []string
+	sc := bufio.NewScanner(strings.NewReader(string(out)))
+	for sc.Scan() {
+		fields := strings.Fields(strings.TrimSpace(sc.Text()))
+		if len(fields) == 0 {
+			continue
+		}
+		units = append(units, fields[0])
+	}
+	return units
+}
+
+// appUnitPathPrefixes are the filesystem locations a customer's own application
+// binary lives in. An ExecStart under one of these (combined with a locally
+// authored unit file) marks a service as a user app rather than an OS daemon.
+var appUnitPathPrefixes = []string{
+	"/home/", "/opt/", "/srv/", "/usr/local/", "/var/www/", "/app/", "/root/",
+}
+
+// localUnitFragmentDir is where admin/locally-authored (and Cloudnan-deployed)
+// unit files land. Vendor OS daemons live under /lib or /usr/lib instead.
+const localUnitFragmentDir = "/etc/systemd/system/"
+
+// agentSystemdUnit is the agent's own unit (installed by scripts/install.sh at
+// /etc/systemd/system/cloudnan-agent.service with ExecStart in /usr/local/bin).
+// It matches isAppUnit, so it must be excluded from App discovery — its lines
+// already ship under the dedicated "agent" source.
+const agentSystemdUnit = "cloudnan-agent.service"
+
+// isAppUnit classifies a service as a customer application from two filesystem
+// facts, independent of the app's language: the unit file is locally authored
+// (FragmentPath under /etc/systemd/system) AND its ExecStart binary lives in an
+// app path (/opt, /home, /srv, ...). This catches a Go/Node/Python/Rust binary
+// run as its own service, which the known-service catalog and the vhost scanner
+// both miss.
+func isAppUnit(fragmentPath, execStartPath string) bool {
+	if !strings.HasPrefix(fragmentPath, localUnitFragmentDir) {
+		return false
+	}
+	for _, p := range appUnitPathPrefixes {
+		if strings.HasPrefix(execStartPath, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// discoverAppUnits returns loaded service units that are customer applications
+// (see isAppUnit) and therefore ship under the App source. The known-service
+// catalog units and the agent's own unit are excluded so a unit is never
+// double-followed or mis-bucketed. Best-effort and read-only.
+func discoverAppUnits(ctx context.Context, selfUnit string) []string {
+	loaded := listLoadedServiceUnits(ctx)
+	candidates := make([]string, 0, len(loaded))
+	for _, u := range loaded {
+		if u == selfUnit || isKnownServiceUnit(u) {
+			continue
+		}
+		candidates = append(candidates, u)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	props := showUnitProps(ctx, candidates)
+	var apps []string
+	for _, unit := range candidates {
+		p := props[unit]
+		if p.fragmentPath == "" {
+			continue
+		}
+		if isAppUnit(p.fragmentPath, p.execStartPath) {
+			apps = append(apps, unit)
+		}
+	}
+	sort.Strings(apps)
+	return apps
+}
+
+type unitProps struct {
+	fragmentPath  string
+	execStartPath string
+}
+
+// showUnitProps batches `systemctl show` for the given units and parses the
+// FragmentPath + ExecStart binary path of each. One block per unit, keyed by
+// the unit's Id.
+func showUnitProps(ctx context.Context, units []string) map[string]unitProps {
+	out := make(map[string]unitProps, len(units))
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return out
+	}
+	cctx, cancel := context.WithTimeout(ctx, sourceDiscoveryTimeout)
+	defer cancel()
+	args := append([]string{"show", "--no-pager",
+		"--property=Id", "--property=FragmentPath", "--property=ExecStart"}, units...)
+	data, err := exec.CommandContext(cctx, "systemctl", args...).Output()
+	if err != nil {
+		return out
+	}
+	var id string
+	var p unitProps
+	flush := func() {
+		if id != "" {
+			out[id] = p
+		}
+		id, p = "", unitProps{}
+	}
+	sc := bufio.NewScanner(strings.NewReader(string(data)))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" { // blank line separates unit blocks
+			flush()
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "Id="):
+			id = strings.TrimPrefix(line, "Id=")
+		case strings.HasPrefix(line, "FragmentPath="):
+			p.fragmentPath = strings.TrimPrefix(line, "FragmentPath=")
+		case strings.HasPrefix(line, "ExecStart=") && p.execStartPath == "":
+			p.execStartPath = parseExecStartPath(strings.TrimPrefix(line, "ExecStart="))
+		}
+	}
+	flush()
+	return out
+}
+
+// parseExecStartPath pulls the binary path out of systemctl's ExecStart value,
+// which looks like `{ path=/opt/app/bin/server ; argv[]=... ; ... }`. Falls back
+// to the first whitespace-delimited token for the rare plain form.
+func parseExecStartPath(v string) string {
+	if i := strings.Index(v, "path="); i >= 0 {
+		rest := v[i+len("path="):]
+		if j := strings.IndexAny(rest, " ;"); j >= 0 {
+			return rest[:j]
+		}
+		return rest
+	}
+	if fields := strings.Fields(v); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 // appLogFile is one log file to tail for a site, and whether it is an error

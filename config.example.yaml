@@ -91,9 +91,15 @@ log_shipper:
   # kernel/udev/internal units are never shipped. Works the same whether
   # Cloudnan installed the stack or the box was built by hand and adopted.
   systemd_units: true
-  # Follow per-site application logs discovered from the web server's vhosts
-  # (nginx access_log/error_log, apache CustomLog/ErrorLog) plus framework logs
-  # (WordPress wp-content/debug.log, Laravel storage/logs). Tagged app:<domain>.
+  # Follow application logs. Two kinds, both auto-discovered:
+  #  - Per-site log files from the web server's vhosts (nginx access_log/
+  #    error_log, apache CustomLog/ErrorLog) plus framework logs (WordPress
+  #    wp-content/debug.log, Laravel storage/logs). Tagged app:<domain>.
+  #  - Customer application services: any locally-authored unit
+  #    (/etc/systemd/system/*.service) whose binary lives in an app path
+  #    (/opt, /home, /srv, /usr/local, /var/www, /app, /root) — a Go/Node/
+  #    Python/etc. binary run as its own service. Followed via journald and
+  #    tagged app:<unit>. Language-agnostic; OS daemons are excluded.
   app_logs: true
   # Stream the agent's own log (source "agent") — gives a fresh box logs even
   # with no Docker/services running.
