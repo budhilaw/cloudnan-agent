@@ -132,6 +132,15 @@ type Monitor struct {
 	containersAt    time.Time
 	firewallCache   *FirewallInfo
 	firewallAt      time.Time
+
+	// Process-list cache. The full top-process scan (process.Processes plus
+	// ~6 /proc reads per PID) is the single heaviest item in Collect and, like
+	// the shell-outs above, must not run on every 5s interval — process metrics
+	// are stored coarsely by the control plane anyway, so a short refresh is
+	// plenty and keeps the per-PID /proc walk off most collections.
+	processMu    sync.Mutex
+	processCache []ProcessInfo
+	processAt    time.Time
 }
 
 const (
@@ -143,6 +152,10 @@ const (
 	// daemon (slow docker socket, apt-lock contention, D-state) can never block
 	// metric collection indefinitely.
 	shellCmdTimeout = 5 * time.Second
+	// processCacheTTL is how long a top-process snapshot is reused before the
+	// next full scan. 15s (vs the 5s collect interval) cuts the /proc walk to a
+	// third of collections while keeping the live process view fresh enough.
+	processCacheTTL = 15 * time.Second
 )
 
 type ioSnapshot struct {
@@ -185,15 +198,18 @@ func (m *Monitor) Collect() (*Metrics, error) {
 		Timestamp: time.Now(),
 	}
 
-	// CPU
-	cpuPercent, err := cpu.Percent(time.Second, false)
-	if err == nil && len(cpuPercent) > 0 {
-		metrics.CPUPercent = cpuPercent[0]
-	}
-
+	// CPU. One blocking sample for per-core usage; the overall percentage is the
+	// mean of the cores. This was two back-to-back cpu.Percent(time.Second, …)
+	// calls — 2 full seconds of blocking on every 5s collect — for no extra
+	// signal, since overall is derivable from per-core.
 	cpuPerCore, err := cpu.Percent(time.Second, true)
-	if err == nil {
+	if err == nil && len(cpuPerCore) > 0 {
 		metrics.CPUPerCore = cpuPerCore
+		var sum float64
+		for _, c := range cpuPerCore {
+			sum += c
+		}
+		metrics.CPUPercent = sum / float64(len(cpuPerCore))
 	}
 
 	// Memory
@@ -312,10 +328,32 @@ func (m *Monitor) Collect() (*Metrics, error) {
 		}
 	}
 
-	// Top Processes
-	metrics.Processes = m.GetTopProcesses(30)
+	// Top Processes (served from a short cache; see topProcessesCached).
+	metrics.Processes = m.topProcessesCached(30)
 
 	return metrics, nil
+}
+
+// topProcessesCached serves the top-process list from a short-lived cache so
+// the expensive full scan runs at most once per processCacheTTL rather than on
+// every 5s Collect. Only Collect calls this (single collector goroutine), so a
+// plain mutex + freshness check is sufficient.
+func (m *Monitor) topProcessesCached(limit int) []ProcessInfo {
+	m.processMu.Lock()
+	if m.processCache != nil && time.Since(m.processAt) < processCacheTTL {
+		cached := m.processCache
+		m.processMu.Unlock()
+		return cached
+	}
+	m.processMu.Unlock()
+
+	fresh := m.GetTopProcesses(limit)
+
+	m.processMu.Lock()
+	m.processCache = fresh
+	m.processAt = time.Now()
+	m.processMu.Unlock()
+	return fresh
 }
 
 // GetTopProcesses returns up to 30 processes: top 20 by CPU + top 10 by disk I/O (deduplicated).

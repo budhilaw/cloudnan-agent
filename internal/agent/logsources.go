@@ -24,9 +24,10 @@ import (
 const (
 	sourceDiscoveryTimeout = 8 * time.Second
 	// Re-discovery cadence: new sites and newly-installed services should start
-	// shipping without an agent restart. Slower than the container rescan (15s)
-	// because units/vhosts change far less often than containers start/stop.
-	sourceRediscoverInterval = 60 * time.Second
+	// shipping without an agent restart. Deliberately slow — units/vhosts change
+	// far less often than containers start/stop, and each pass spawns systemctl
+	// (list-units + show), so a tight interval is wasted CPU on small VMs.
+	sourceRediscoverInterval = 120 * time.Second
 )
 
 // knownServiceUnit matches a systemd unit NAME against the catalog. A unit is
